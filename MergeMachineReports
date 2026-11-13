@@ -1,0 +1,1493 @@
+Option Explicit
+
+'修正版 v4（202610 raw data）：
+'1. TW 與 MX/VN 月份欄位起點不同，改用完整年月對齊後加總。
+'2. 一班/兩班等規劃產能與加班最大產量改為 TW+MX+VN 加總。
+'3. 當月實際生產產能仍以 TW 為準；錯誤值仍視為 0。
+'4. T 欄「3個月平均」統一改為：由 B:S 從左往右取前 3 筆數字平均。
+
+'============================================================
+' 主程式
+'============================================================
+Public Sub 合併三地機台報表()
+    Dim wb As Workbook
+    Dim wsTW As Worksheet, wsMX As Worksheet, wsVN As Worksheet
+    Dim wsOut As Worksheet, wsTemplate As Worksheet
+    Dim devices As Variant
+    Dim deviceName As String
+    Dim outputName As String
+    Dim reportDate As Date
+    Dim outRow As Long, blockRows As Long
+    Dim i As Long, exportedCount As Long
+
+    Dim twStart As Long, twEnd As Long
+    Dim mxStart As Long, mxEnd As Long
+    Dim vnStart As Long, vnEnd As Long
+    Dim templateStart As Long, templateEnd As Long
+    Dim hasTW As Boolean, hasMX As Boolean, hasVN As Boolean
+
+    Dim skipped As String
+    Dim oldCalculation As XlCalculation
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+    Dim oldDisplayAlerts As Boolean
+    Dim oldStatusBar As Variant
+    Dim errorMessage As String
+    Dim stateSaved As Boolean
+    Dim currentStep As String
+
+    On Error GoTo ErrorHandler
+
+    currentStep = "取得作用中活頁簿"
+    Set wb = ActiveWorkbook
+    If wb Is Nothing Then Err.Raise vbObjectError + 1000, , "找不到作用中的活頁簿。"
+
+    currentStep = "尋找 TW、MX、VN 來源分頁"
+    Set wsTW = FindSheetBySuffix(wb, "TW")
+    Set wsMX = FindSheetBySuffix(wb, "MX")
+    Set wsVN = FindSheetBySuffix(wb, "VN")
+
+    If wsTW Is Nothing Then Err.Raise vbObjectError + 1001, , "找不到名稱後綴為 TW 的分頁。"
+    If wsMX Is Nothing Then Err.Raise vbObjectError + 1002, , "找不到名稱後綴為 MX 的分頁。"
+    If wsVN Is Nothing Then Err.Raise vbObjectError + 1003, , "找不到名稱後綴為 VN 的分頁。"
+
+    oldCalculation = Application.Calculation
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+    oldDisplayAlerts = Application.DisplayAlerts
+    oldStatusBar = Application.StatusBar
+    stateSaved = True
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.StatusBar = "正在計算來源報表……"
+
+    '確保公式已更新；公式錯誤會在加總時視為 0。
+    Application.CalculateFull
+    Application.Calculation = xlCalculationManual
+
+    outputName = BuildOutputSheetName(wsTW.Name)
+
+    If WorksheetExists(wb, outputName) Then
+        wb.Worksheets(outputName).Delete
+    End If
+
+    Set wsOut = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.count))
+    wsOut.Name = outputName
+
+    CopyColumnLayout wsTW, wsOut, 1, 20
+
+    'Excel 依本機排序規則進行升冪排序。
+    currentStep = "排序設備清單"
+    devices = GetSortedDevices(wb)
+    reportDate = ExtractReportDate(wsTW.Name)
+
+    outRow = 1
+
+    For i = LBound(devices) To UBound(devices)
+        deviceName = CStr(devices(i))
+        currentStep = "處理設備：" & deviceName
+        Application.StatusBar = "正在合併設備：" & deviceName
+
+        hasTW = FindDeviceBlock(wsTW, deviceName, twStart, twEnd)
+        hasMX = FindDeviceBlock(wsMX, deviceName, mxStart, mxEnd)
+        hasVN = FindDeviceBlock(wsVN, deviceName, vnStart, vnEnd)
+
+        Set wsTemplate = Nothing
+        templateStart = 0
+        templateEnd = 0
+
+        '格式優先使用 TW；TW 沒有時才改用其他地區。
+        If hasTW Then
+            Set wsTemplate = wsTW
+            templateStart = twStart
+            templateEnd = twEnd
+        ElseIf hasMX Then
+            Set wsTemplate = wsMX
+            templateStart = mxStart
+            templateEnd = mxEnd
+        ElseIf hasVN Then
+            Set wsTemplate = wsVN
+            templateStart = vnStart
+            templateEnd = vnEnd
+        End If
+
+        If wsTemplate Is Nothing Then
+            If Len(skipped) > 0 Then skipped = skipped & "、"
+            skipped = skipped & deviceName
+        Else
+            blockRows = templateEnd - templateStart + 1
+
+            CopyTemplateBlock wsTemplate, templateStart, templateEnd, wsOut, outRow
+
+            MergeOneDeviceBlock _
+                wsOut:=wsOut, _
+                outStart:=outRow, _
+                templateWS:=wsTemplate, _
+                templateStart:=templateStart, _
+                templateEnd:=templateEnd, _
+                displayDeviceName:=deviceName, _
+                wsTW:=wsTW, twStart:=twStart, twEnd:=twEnd, hasTW:=hasTW, _
+                wsMX:=wsMX, mxStart:=mxStart, mxEnd:=mxEnd, hasMX:=hasMX, _
+                wsVN:=wsVN, vnStart:=vnStart, vnEnd:=vnEnd, hasVN:=hasVN, _
+                reportDate:=reportDate
+
+            exportedCount = exportedCount + 1
+            outRow = outRow + blockRows + 1
+        End If
+    Next i
+
+    If outRow > 1 Then
+        wsOut.Rows(outRow - 1).Delete
+    End If
+
+    wsOut.Calculate
+    wsOut.Activate
+    wsOut.Range("A1").Select
+
+CleanExit:
+    If stateSaved Then
+        Application.Calculation = oldCalculation
+        Application.ScreenUpdating = oldScreenUpdating
+        Application.EnableEvents = oldEnableEvents
+        Application.DisplayAlerts = oldDisplayAlerts
+        Application.StatusBar = oldStatusBar
+    End If
+    Application.CutCopyMode = False
+
+    If Len(skipped) = 0 Then
+        MsgBox "合併完成，共輸出 " & exportedCount & " 項設備。" & vbCrLf & _
+               "輸出分頁：" & outputName, vbInformation
+    Else
+        MsgBox "合併完成，共輸出 " & exportedCount & " 項設備。" & vbCrLf & _
+               "以下設備在三張來源分頁都找不到，因此未輸出：" & vbCrLf & skipped, vbExclamation
+    End If
+    Exit Sub
+
+ErrorHandler:
+    errorMessage = "執行失敗：" & Err.Description & vbCrLf & _
+                   "位置：" & currentStep & vbCrLf & _
+                   "錯誤代碼：" & Err.Number
+
+    If stateSaved Then
+        Application.Calculation = oldCalculation
+        Application.ScreenUpdating = oldScreenUpdating
+        Application.EnableEvents = oldEnableEvents
+        Application.DisplayAlerts = oldDisplayAlerts
+        Application.StatusBar = oldStatusBar
+    End If
+    Application.CutCopyMode = False
+    MsgBox errorMessage, vbCritical
+End Sub
+
+'============================================================
+' 合併單一設備區塊
+'============================================================
+Private Sub MergeOneDeviceBlock( _
+    ByVal wsOut As Worksheet, _
+    ByVal outStart As Long, _
+    ByVal templateWS As Worksheet, _
+    ByVal templateStart As Long, _
+    ByVal templateEnd As Long, _
+    ByVal displayDeviceName As String, _
+    ByVal wsTW As Worksheet, ByVal twStart As Long, ByVal twEnd As Long, ByVal hasTW As Boolean, _
+    ByVal wsMX As Worksheet, ByVal mxStart As Long, ByVal mxEnd As Long, ByVal hasMX As Boolean, _
+    ByVal wsVN As Worksheet, ByVal vnStart As Long, ByVal vnEnd As Long, ByVal hasVN As Boolean, _
+    ByVal reportDate As Date)
+
+    Dim mapTW As Object, mapMX As Object, mapVN As Object
+    Dim forecastRows As Object
+    Dim forecastTW As Object, forecastMX As Object, forecastVN As Object
+    Dim forecastTemplate As Object
+    Dim capTemplate As Object, capTW As Object, capMX As Object, capVN As Object
+
+    Dim labelText As String, normalizedLabel As String
+    Dim outR As Long, sourceR As Long
+    Dim rOffset As Long
+    Dim headerOutRow As Long
+    Dim templateHeaderRow As Long
+    Dim twHeaderRow As Long, mxHeaderRow As Long, vnHeaderRow As Long
+    Dim actualOutRow As Long
+    Dim changeRatioOutRow As Long
+    Dim loadRatioOutRow As Long
+    Dim normalCapacityOutRow As Long
+    Dim correctedForecastOutRow As Long
+    Dim forecastYear As Long, forecastMonth As Long
+    Dim capacitySlot As Long
+
+    Dim templateColDates As Variant
+    Dim twColDates As Variant, mxColDates As Variant, vnColDates As Variant
+
+    Set mapTW = CreateObject("Scripting.Dictionary")
+    Set mapMX = CreateObject("Scripting.Dictionary")
+    Set mapVN = CreateObject("Scripting.Dictionary")
+    Set forecastRows = CreateObject("Scripting.Dictionary")
+    Set forecastTW = CreateObject("Scripting.Dictionary")
+    Set forecastMX = CreateObject("Scripting.Dictionary")
+    Set forecastVN = CreateObject("Scripting.Dictionary")
+    Set capTemplate = CreateObject("Scripting.Dictionary")
+    Set capTW = CreateObject("Scripting.Dictionary")
+    Set capMX = CreateObject("Scripting.Dictionary")
+    Set capVN = CreateObject("Scripting.Dictionary")
+
+    mapTW.CompareMode = vbTextCompare
+    mapMX.CompareMode = vbTextCompare
+    mapVN.CompareMode = vbTextCompare
+    forecastRows.CompareMode = vbTextCompare
+    forecastTW.CompareMode = vbTextCompare
+    forecastMX.CompareMode = vbTextCompare
+    forecastVN.CompareMode = vbTextCompare
+
+    If hasTW Then
+        Set mapTW = BuildRowMap(wsTW, twStart, twEnd)
+        Set forecastTW = BuildForecastRowMap(wsTW, twStart, twEnd)
+        Set capTW = BuildPlannedCapacityMap(wsTW, twStart, twEnd)
+        twHeaderRow = FindMonthHeaderRow(wsTW, twStart, twEnd)
+        If twHeaderRow > 0 Then twColDates = BuildColumnDates(wsTW, twHeaderRow, forecastTW)
+    End If
+
+    If hasMX Then
+        Set mapMX = BuildRowMap(wsMX, mxStart, mxEnd)
+        Set forecastMX = BuildForecastRowMap(wsMX, mxStart, mxEnd)
+        Set capMX = BuildPlannedCapacityMap(wsMX, mxStart, mxEnd)
+        mxHeaderRow = FindMonthHeaderRow(wsMX, mxStart, mxEnd)
+        If mxHeaderRow > 0 Then mxColDates = BuildColumnDates(wsMX, mxHeaderRow, forecastMX)
+    End If
+
+    If hasVN Then
+        Set mapVN = BuildRowMap(wsVN, vnStart, vnEnd)
+        Set forecastVN = BuildForecastRowMap(wsVN, vnStart, vnEnd)
+        Set capVN = BuildPlannedCapacityMap(wsVN, vnStart, vnEnd)
+        vnHeaderRow = FindMonthHeaderRow(wsVN, vnStart, vnEnd)
+        If vnHeaderRow > 0 Then vnColDates = BuildColumnDates(wsVN, vnHeaderRow, forecastVN)
+    End If
+
+    Set capTemplate = BuildPlannedCapacityMap(templateWS, templateStart, templateEnd)
+    templateHeaderRow = FindMonthHeaderRow(templateWS, templateStart, templateEnd)
+
+    If templateHeaderRow > 0 Then
+        headerOutRow = outStart + templateHeaderRow - templateStart
+
+        If templateWS Is wsTW Then
+            templateColDates = twColDates
+        ElseIf templateWS Is wsMX Then
+            templateColDates = mxColDates
+        ElseIf templateWS Is wsVN Then
+            templateColDates = vnColDates
+        Else
+            Set forecastTemplate = BuildForecastRowMap(templateWS, templateStart, templateEnd)
+            templateColDates = BuildColumnDates(templateWS, templateHeaderRow, forecastTemplate)
+        End If
+    End If
+
+    For rOffset = 0 To templateEnd - templateStart
+        sourceR = templateStart + rOffset
+        outR = outStart + rOffset
+        labelText = GetCellText(templateWS.Cells(sourceR, 1))
+        normalizedLabel = NormalizeText(labelText)
+
+        '將 A 欄公式轉成目前顯示的列標籤。
+        wsOut.Cells(outR, 1).value = labelText
+
+        If sourceR = templateHeaderRow Then
+            '標題列保留範本的月份文字，不進行加總。
+            CopyRowValues templateWS, sourceR, wsOut, outR, 2, 20
+
+        ElseIf normalizedLabel = NormalizeText("當月實際下單跟上月預估") Then
+            changeRatioOutRow = outR
+            wsOut.Range(wsOut.Cells(outR, 2), wsOut.Cells(outR, 20)).ClearContents
+
+        ElseIf normalizedLabel = NormalizeText("產能負荷率") Then
+            loadRatioOutRow = outR
+            wsOut.Range(wsOut.Cells(outR, 2), wsOut.Cells(outR, 20)).ClearContents
+
+        Else
+            capacitySlot = GetCapacitySlotForRow(capTemplate, sourceR)
+
+            If capacitySlot > 0 Then
+                '202610 起：規劃產能/最大產能列改為三地加總。
+                '各地列名可能不同，因此依「產能區第幾列」對應，而不是依 A 欄文字硬配。
+                WriteSummedCapacitySlotRow _
+                    wsOut:=wsOut, outRow:=outR, capacitySlot:=capacitySlot, _
+                    templateWS:=templateWS, templateHeaderRow:=templateHeaderRow, templateColDates:=templateColDates, _
+                    wsTW:=wsTW, capTW:=capTW, twHeaderRow:=twHeaderRow, twColDates:=twColDates, _
+                    wsMX:=wsMX, capMX:=capMX, mxHeaderRow:=mxHeaderRow, mxColDates:=mxColDates, _
+                    wsVN:=wsVN, capVN:=capVN, vnHeaderRow:=vnHeaderRow, vnColDates:=vnColDates
+
+                If normalCapacityOutRow = 0 Then normalCapacityOutRow = outR
+
+            ElseIf IsTWOnlyRow(labelText) Then
+                '當月實際生產產能等非規劃產能列仍以 TW 為準。
+                WriteTWOnlyRow wsOut, outR, labelText, wsTW, mapTW
+
+            Else
+                '一般數量列依「實際年月」對齊後再加總，
+                '避免 TW 與 MX/VN 時間軸起始月份不同時錯欄相加。
+                WriteSummedRowMapped _
+                    wsOut:=wsOut, outRow:=outR, labelText:=labelText, _
+                    templateWS:=templateWS, templateHeaderRow:=templateHeaderRow, templateColDates:=templateColDates, _
+                    wsTW:=wsTW, mapTW:=mapTW, twHeaderRow:=twHeaderRow, twColDates:=twColDates, _
+                    wsMX:=wsMX, mapMX:=mapMX, mxHeaderRow:=mxHeaderRow, mxColDates:=mxColDates, _
+                    wsVN:=wsVN, mapVN:=mapVN, vnHeaderRow:=vnHeaderRow, vnColDates:=vnColDates
+            End If
+        End If
+
+        If IsActualOrderLabel(labelText) Then actualOutRow = outR
+
+        If normalizedLabel = NormalizeText("修正後產能預估") Then
+            correctedForecastOutRow = outR
+        End If
+
+        If TryParseForecastLabel(labelText, forecastYear, forecastMonth) Then
+            forecastRows(FormatYearMonth(forecastYear, forecastMonth)) = outR
+        End If
+    Next rOffset
+
+    '輸出標題一律使用使用者指定的設備名稱。
+    wsOut.Cells(outStart, 1).value = displayDeviceName
+
+    If headerOutRow > 0 Then
+        If changeRatioOutRow > 0 And actualOutRow > 0 Then
+            RecalculateChangeRatios wsOut, changeRatioOutRow, actualOutRow, forecastRows, templateColDates
+        End If
+
+        If loadRatioOutRow > 0 And actualOutRow > 0 Then
+            RecalculateCapacityLoads wsOut, loadRatioOutRow, actualOutRow, normalCapacityOutRow
+        End If
+
+        'T 欄「3個月平均」一律取 B:S 由左往右前 3 筆數字。
+        '空白、文字及錯誤值不列入；公式列視為數字候選。
+        RecalculateBlockThreeMonthAverages wsOut, outStart, outStart + (templateEnd - templateStart), headerOutRow
+    End If
+End Sub
+
+'============================================================
+' 加總及 TW 保留規則
+'============================================================
+Private Sub WriteSummedRowMapped( _
+    ByVal wsOut As Worksheet, ByVal outRow As Long, ByVal labelText As String, _
+    ByVal templateWS As Worksheet, ByVal templateHeaderRow As Long, ByVal templateColDates As Variant, _
+    ByVal wsTW As Worksheet, ByVal mapTW As Object, ByVal twHeaderRow As Long, ByVal twColDates As Variant, _
+    ByVal wsMX As Worksheet, ByVal mapMX As Object, ByVal mxHeaderRow As Long, ByVal mxColDates As Variant, _
+    ByVal wsVN As Worksheet, ByVal mapVN As Object, ByVal vnHeaderRow As Long, ByVal vnColDates As Variant)
+
+    Dim c As Long
+    Dim total As Double
+    Dim hasAnyValue As Boolean
+    Dim key As String
+
+    key = NormalizeText(labelText)
+
+    For c = 2 To 20
+        total = 0
+        hasAnyValue = False
+
+        AddSourceMappedCellToTotal wsTW, mapTW, key, c, _
+                                   templateWS, templateHeaderRow, templateColDates, _
+                                   twHeaderRow, twColDates, total, hasAnyValue
+
+        AddSourceMappedCellToTotal wsMX, mapMX, key, c, _
+                                   templateWS, templateHeaderRow, templateColDates, _
+                                   mxHeaderRow, mxColDates, total, hasAnyValue
+
+        AddSourceMappedCellToTotal wsVN, mapVN, key, c, _
+                                   templateWS, templateHeaderRow, templateColDates, _
+                                   vnHeaderRow, vnColDates, total, hasAnyValue
+
+        If hasAnyValue Then
+            wsOut.Cells(outRow, c).value = total
+        Else
+            wsOut.Cells(outRow, c).ClearContents
+        End If
+    Next c
+End Sub
+
+Private Sub AddSourceMappedCellToTotal( _
+    ByVal ws As Worksheet, ByVal rowMap As Object, ByVal key As String, ByVal outputColumn As Long, _
+    ByVal templateWS As Worksheet, ByVal templateHeaderRow As Long, ByVal templateColDates As Variant, _
+    ByVal sourceHeaderRow As Long, ByVal sourceColDates As Variant, _
+    ByRef total As Double, ByRef hasAnyValue As Boolean)
+
+    Dim sourceRow As Long
+    Dim sourceColumn As Long
+    Dim cellHasContent As Boolean
+
+    If ws Is Nothing Then Exit Sub
+    If rowMap Is Nothing Then Exit Sub
+    If Not rowMap.Exists(key) Then Exit Sub
+
+    sourceRow = CLng(rowMap(key))
+
+    If outputColumn = 20 Then
+        sourceColumn = 20
+    Else
+        sourceColumn = GetMappedSourceColumn( _
+                           outputColumn, _
+                           templateWS, templateHeaderRow, templateColDates, _
+                           ws, sourceHeaderRow, sourceColDates)
+    End If
+
+    If sourceColumn = 0 Then Exit Sub
+
+    total = total + GetNumericCellValue(ws.Cells(sourceRow, sourceColumn), cellHasContent)
+    If cellHasContent Then hasAnyValue = True
+End Sub
+
+Private Sub WriteSummedCapacitySlotRow( _
+    ByVal wsOut As Worksheet, ByVal outRow As Long, ByVal capacitySlot As Long, _
+    ByVal templateWS As Worksheet, ByVal templateHeaderRow As Long, ByVal templateColDates As Variant, _
+    ByVal wsTW As Worksheet, ByVal capTW As Object, ByVal twHeaderRow As Long, ByVal twColDates As Variant, _
+    ByVal wsMX As Worksheet, ByVal capMX As Object, ByVal mxHeaderRow As Long, ByVal mxColDates As Variant, _
+    ByVal wsVN As Worksheet, ByVal capVN As Object, ByVal vnHeaderRow As Long, ByVal vnColDates As Variant)
+
+    Dim c As Long
+    Dim total As Double
+    Dim hasAnyValue As Boolean
+
+    For c = 2 To 20
+        total = 0
+        hasAnyValue = False
+
+        AddCapacitySlotCellToTotal wsTW, capTW, capacitySlot, c, _
+                                   templateWS, templateHeaderRow, templateColDates, _
+                                   twHeaderRow, twColDates, total, hasAnyValue
+
+        AddCapacitySlotCellToTotal wsMX, capMX, capacitySlot, c, _
+                                   templateWS, templateHeaderRow, templateColDates, _
+                                   mxHeaderRow, mxColDates, total, hasAnyValue
+
+        AddCapacitySlotCellToTotal wsVN, capVN, capacitySlot, c, _
+                                   templateWS, templateHeaderRow, templateColDates, _
+                                   vnHeaderRow, vnColDates, total, hasAnyValue
+
+        If hasAnyValue Then
+            wsOut.Cells(outRow, c).value = total
+        Else
+            wsOut.Cells(outRow, c).ClearContents
+        End If
+    Next c
+End Sub
+
+Private Sub AddCapacitySlotCellToTotal( _
+    ByVal ws As Worksheet, ByVal capacityMap As Object, ByVal capacitySlot As Long, ByVal outputColumn As Long, _
+    ByVal templateWS As Worksheet, ByVal templateHeaderRow As Long, ByVal templateColDates As Variant, _
+    ByVal sourceHeaderRow As Long, ByVal sourceColDates As Variant, _
+    ByRef total As Double, ByRef hasAnyValue As Boolean)
+
+    Dim sourceRow As Long
+    Dim sourceColumn As Long
+    Dim cellHasContent As Boolean
+    Dim slotKey As String
+
+    If ws Is Nothing Then Exit Sub
+    If capacityMap Is Nothing Then Exit Sub
+
+    slotKey = CStr(capacitySlot)
+    If Not capacityMap.Exists(slotKey) Then Exit Sub
+
+    sourceRow = CLng(capacityMap(slotKey))
+
+    If outputColumn = 20 Then
+        sourceColumn = 20
+    Else
+        sourceColumn = GetMappedSourceColumn( _
+                           outputColumn, _
+                           templateWS, templateHeaderRow, templateColDates, _
+                           ws, sourceHeaderRow, sourceColDates)
+    End If
+
+    If sourceColumn = 0 Then Exit Sub
+
+    total = total + GetNumericCellValue(ws.Cells(sourceRow, sourceColumn), cellHasContent)
+    If cellHasContent Then hasAnyValue = True
+End Sub
+
+Private Function GetMappedSourceColumn( _
+    ByVal outputColumn As Long, _
+    ByVal templateWS As Worksheet, ByVal templateHeaderRow As Long, ByVal templateColDates As Variant, _
+    ByVal sourceWS As Worksheet, ByVal sourceHeaderRow As Long, ByVal sourceColDates As Variant) As Long
+
+    Dim c As Long
+    Dim outputHeaderKey As String
+    Dim sourceHeaderKey As String
+    Dim wantedOccurrence As Long
+    Dim sourceOccurrence As Long
+
+    If outputColumn < 2 Or outputColumn > 19 Then Exit Function
+    If templateHeaderRow <= 0 Or sourceHeaderRow <= 0 Then Exit Function
+
+    '優先用完整年月配對。這能處理 TW 與 MX/VN 起始月份不同的情況。
+    If VariantArrayItemIsDate(templateColDates, outputColumn) Then
+        For c = 2 To 19
+            If VariantArrayItemIsDate(sourceColDates, c) Then
+                If CLng(CDate(sourceColDates(c))) = CLng(CDate(templateColDates(outputColumn))) Then
+                    GetMappedSourceColumn = c
+                    Exit Function
+                End If
+            End If
+        Next c
+
+        '已能判斷輸出欄為月份，但來源沒有該年月時，不以位置硬湊。
+        Exit Function
+    End If
+
+    '非月份欄（例如 Hanger(打頭)）改以標題文字及出現次序配對。
+    outputHeaderKey = NormalizeText(GetCellText(templateWS.Cells(templateHeaderRow, outputColumn)))
+    If Len(outputHeaderKey) = 0 Then Exit Function
+
+    For c = 2 To outputColumn
+        If NormalizeText(GetCellText(templateWS.Cells(templateHeaderRow, c))) = outputHeaderKey Then
+            wantedOccurrence = wantedOccurrence + 1
+        End If
+    Next c
+
+    For c = 2 To 19
+        sourceHeaderKey = NormalizeText(GetCellText(sourceWS.Cells(sourceHeaderRow, c)))
+
+        If sourceHeaderKey = outputHeaderKey Then
+            sourceOccurrence = sourceOccurrence + 1
+
+            If sourceOccurrence = wantedOccurrence Then
+                GetMappedSourceColumn = c
+                Exit Function
+            End If
+        End If
+    Next c
+End Function
+
+Private Function VariantArrayItemIsDate(ByVal valuesArray As Variant, ByVal itemIndex As Long) As Boolean
+    On Error GoTo SafeExit
+
+    If IsArray(valuesArray) Then
+        If itemIndex >= LBound(valuesArray) And itemIndex <= UBound(valuesArray) Then
+            VariantArrayItemIsDate = IsDate(valuesArray(itemIndex))
+        End If
+    End If
+
+SafeExit:
+End Function
+
+Private Sub WriteTWOnlyRow( _
+    ByVal wsOut As Worksheet, ByVal outRow As Long, ByVal labelText As String, _
+    ByVal wsTW As Worksheet, ByVal mapTW As Object)
+
+    Dim c As Long
+    Dim sourceRow As Long
+    Dim present As Boolean
+    Dim cellValue As Variant
+    Dim key As String
+
+    key = NormalizeText(labelText)
+
+    If mapTW Is Nothing Then
+        wsOut.Range(wsOut.Cells(outRow, 2), wsOut.Cells(outRow, 20)).ClearContents
+        Exit Sub
+    End If
+
+    If Not mapTW.Exists(key) Then
+        wsOut.Range(wsOut.Cells(outRow, 2), wsOut.Cells(outRow, 20)).ClearContents
+        Exit Sub
+    End If
+
+    sourceRow = CLng(mapTW(key))
+
+    For c = 2 To 20
+        cellValue = GetCellValueForOutput(wsTW.Cells(sourceRow, c), present)
+
+        If present Then
+            wsOut.Cells(outRow, c).value = cellValue
+        Else
+            wsOut.Cells(outRow, c).ClearContents
+        End If
+    Next c
+End Sub
+
+Private Function IsTWOnlyRow(ByVal labelText As String) As Boolean
+    Dim key As String
+    key = NormalizeText(labelText)
+
+    If key = NormalizeText("修正後產能預估") Then Exit Function
+    If key = NormalizeText("產能負荷率") Then Exit Function
+    If key = NormalizeText("當月實際下單跟上月預估") Then Exit Function
+
+    If InStr(1, key, NormalizeText("產能"), vbTextCompare) > 0 Then
+        IsTWOnlyRow = True
+    ElseIf InStr(1, key, NormalizeText("加班最大產量"), vbTextCompare) > 0 Then
+        IsTWOnlyRow = True
+    ElseIf InStr(1, key, NormalizeText("產量"), vbTextCompare) > 0 _
+       And InStr(1, key, NormalizeText("預估"), vbTextCompare) = 0 Then
+        IsTWOnlyRow = True
+    End If
+End Function
+
+Private Function IsNormalCapacityRow(ByVal labelText As String) As Boolean
+    Dim key As String
+    key = NormalizeText(labelText)
+
+    If key = NormalizeText("修正後產能預估") Then Exit Function
+    If key = NormalizeText("當月實際生產產能") Then Exit Function
+    If key = NormalizeText("產能負荷率") Then Exit Function
+    If InStr(1, key, NormalizeText("加班最大產量"), vbTextCompare) > 0 Then Exit Function
+
+    If InStr(1, key, NormalizeText("產能"), vbTextCompare) > 0 Then
+        IsNormalCapacityRow = True
+    End If
+End Function
+
+'============================================================
+' 比率及三個月平均
+'============================================================
+
+Private Sub RecalculateBlockThreeMonthAverages( _
+    ByVal wsOut As Worksheet, ByVal firstRow As Long, ByVal lastRow As Long, ByVal headerRow As Long)
+
+    Dim r As Long
+    Dim c As Long
+    Dim selectedCols(1 To 3) As Long
+    Dim selectedCount As Long
+
+    For r = firstRow To lastRow
+        '設備名稱列與月份標題列不計算平均。
+        If r <> firstRow And r <> headerRow Then
+            selectedCount = 0
+
+            For c = 2 To 19
+                If CellIsNumericCandidateForAverage(wsOut.Cells(r, c)) Then
+                    selectedCount = selectedCount + 1
+                    selectedCols(selectedCount) = c
+                    If selectedCount = 3 Then Exit For
+                End If
+            Next c
+
+            If selectedCount = 3 Then
+                WriteThreeCellAverageFormula wsOut, r, _
+                                             selectedCols(1), _
+                                             selectedCols(2), _
+                                             selectedCols(3)
+            Else
+                wsOut.Cells(r, 20).ClearContents
+            End If
+        End If
+    Next r
+End Sub
+
+Private Function CellIsNumericCandidateForAverage(ByVal targetCell As Range) As Boolean
+    On Error GoTo SafeExit
+
+    If targetCell.HasFormula Then
+        '本程式產生的比率/負荷率公式皆回傳數字，公式直接視為候選。
+        CellIsNumericCandidateForAverage = True
+        Exit Function
+    End If
+
+    If IsError(targetCell.value) Then Exit Function
+    If Len(CStr(targetCell.value)) = 0 Then Exit Function
+
+    If IsNumeric(targetCell.value) Then
+        CellIsNumericCandidateForAverage = True
+    End If
+
+SafeExit:
+End Function
+
+Private Sub RecalculateForecastAverages( _
+    ByVal wsOut As Worksheet, ByVal forecastRows As Object, ByVal colDates As Variant)
+
+    Dim key As Variant
+    Dim rowNumber As Long
+    Dim forecastDate As Date
+    Dim selectedCols(1 To 3) As Long
+    Dim selectedCount As Long
+    Dim c As Long
+
+    For Each key In forecastRows.Keys
+        rowNumber = CLng(forecastRows(key))
+        forecastDate = YearMonthKeyToDate(CStr(key))
+        selectedCount = 0
+
+        For c = 2 To 19
+            If IsDate(colDates(c)) Then
+                If CDate(colDates(c)) > forecastDate Then
+                    selectedCount = selectedCount + 1
+                    selectedCols(selectedCount) = c
+                    If selectedCount = 3 Then Exit For
+                End If
+            End If
+        Next c
+
+        If selectedCount = 3 Then
+            WriteThreeCellAverageFormula wsOut, rowNumber, selectedCols(1), selectedCols(2), selectedCols(3)
+        Else
+            wsOut.Cells(rowNumber, 20).ClearContents
+        End If
+    Next key
+End Sub
+
+Private Sub RecalculateCorrectedForecastAverage(ByVal wsOut As Worksheet, ByVal rowNumber As Long)
+    Dim selectedCols(1 To 3) As Long
+    Dim selectedCount As Long
+    Dim c As Long
+
+    For c = 2 To 19
+        If CellHasOutputContent(wsOut.Cells(rowNumber, c)) Then
+            selectedCount = selectedCount + 1
+            selectedCols(selectedCount) = c
+            If selectedCount = 3 Then Exit For
+        End If
+    Next c
+
+    If selectedCount = 3 Then
+        WriteThreeCellAverageFormula wsOut, rowNumber, selectedCols(1), selectedCols(2), selectedCols(3)
+    Else
+        wsOut.Cells(rowNumber, 20).ClearContents
+    End If
+End Sub
+
+Private Sub RecalculateActualAverage( _
+    ByVal wsOut As Worksheet, ByVal actualRow As Long, ByVal colDates As Variant, ByVal reportDate As Date)
+
+    Dim actualMonth As Long
+    Dim targetCol As Long
+    Dim c As Long
+    Dim validCols() As Long
+    Dim validCount As Long
+
+    actualMonth = ExtractActualMonth(GetCellText(wsOut.Cells(actualRow, 1)))
+    If actualMonth = 0 Then Exit Sub
+
+    '優先使用報表名稱中的年月，例如 202607 對應 2026 年 7 月。
+    If reportDate <> 0 Then
+        For c = 2 To 19
+            If IsDate(colDates(c)) Then
+                If Year(CDate(colDates(c))) = Year(reportDate) _
+                   And Month(CDate(colDates(c))) = actualMonth Then
+                    targetCol = c
+                    Exit For
+                End If
+            End If
+        Next c
+    End If
+
+    '找不到精確年月時，改取最右側相同月份。
+    If targetCol = 0 Then
+        For c = 2 To 19
+            If IsDate(colDates(c)) Then
+                If Month(CDate(colDates(c))) = actualMonth Then targetCol = c
+            End If
+        Next c
+    End If
+
+    If targetCol = 0 Then
+        wsOut.Cells(actualRow, 20).ClearContents
+        Exit Sub
+    End If
+
+    ReDim validCols(1 To 18)
+
+    For c = 2 To targetCol
+        If IsDate(colDates(c)) Then
+            validCount = validCount + 1
+            validCols(validCount) = c
+        End If
+    Next c
+
+    If validCount >= 3 Then
+        WriteThreeCellAverageFormula wsOut, actualRow, _
+                                     validCols(validCount - 2), _
+                                     validCols(validCount - 1), _
+                                     validCols(validCount)
+    Else
+        wsOut.Cells(actualRow, 20).ClearContents
+    End If
+End Sub
+
+Private Sub RecalculateChangeRatios( _
+    ByVal wsOut As Worksheet, ByVal ratioRow As Long, ByVal actualRow As Long, _
+    ByVal forecastRows As Object, ByVal colDates As Variant)
+
+    Dim c As Long
+    Dim previousMonth As Date
+    Dim forecastKey As String
+    Dim forecastRow As Long
+    Dim actualAddress As String, forecastAddress As String
+
+    For c = 2 To 19
+        If CellHasOutputContent(wsOut.Cells(actualRow, c)) And IsDate(colDates(c)) Then
+            previousMonth = DateAdd("m", -1, CDate(colDates(c)))
+            forecastKey = FormatYearMonth(Year(previousMonth), Month(previousMonth))
+
+            If forecastRows.Exists(forecastKey) Then
+                forecastRow = CLng(forecastRows(forecastKey))
+                actualAddress = wsOut.Cells(actualRow, c).Address(False, False)
+                forecastAddress = wsOut.Cells(forecastRow, c).Address(False, False)
+
+                wsOut.Cells(ratioRow, c).Formula = _
+                    "=IFERROR(" & actualAddress & "/" & forecastAddress & "-1,0)"
+            Else
+                wsOut.Cells(ratioRow, c).value = 0
+            End If
+        Else
+            wsOut.Cells(ratioRow, c).ClearContents
+        End If
+    Next c
+
+    wsOut.Cells(ratioRow, 20).ClearContents
+End Sub
+
+Private Sub RecalculateCapacityLoads( _
+    ByVal wsOut As Worksheet, ByVal loadRow As Long, ByVal actualRow As Long, ByVal capacityRow As Long)
+
+    Dim c As Long
+    Dim actualAddress As String, capacityAddress As String
+
+    For c = 2 To 20
+        If CellHasOutputContent(wsOut.Cells(actualRow, c)) Then
+            'VBA 的 And 不會短路判斷；capacityRow=0 時不可讀取第 0 列。
+            If capacityRow > 0 Then
+                If CellHasOutputContent(wsOut.Cells(capacityRow, c)) Then
+                    actualAddress = wsOut.Cells(actualRow, c).Address(False, False)
+                    capacityAddress = wsOut.Cells(capacityRow, c).Address(False, False)
+
+                    wsOut.Cells(loadRow, c).Formula = _
+                        "=IFERROR(" & actualAddress & "/" & capacityAddress & ",0)"
+                Else
+                    wsOut.Cells(loadRow, c).value = 0
+                End If
+            Else
+                wsOut.Cells(loadRow, c).value = 0
+            End If
+        Else
+            wsOut.Cells(loadRow, c).ClearContents
+        End If
+    Next c
+End Sub
+
+Private Sub WriteThreeCellAverageFormula( _
+    ByVal ws As Worksheet, ByVal rowNumber As Long, _
+    ByVal col1 As Long, ByVal col2 As Long, ByVal col3 As Long)
+
+    Dim address1 As String, address2 As String, address3 As String
+
+    address1 = ws.Cells(rowNumber, col1).Address(False, False)
+    address2 = ws.Cells(rowNumber, col2).Address(False, False)
+    address3 = ws.Cells(rowNumber, col3).Address(False, False)
+
+    ws.Cells(rowNumber, 20).Formula = _
+        "=IFERROR((" & address1 & "+" & address2 & "+" & address3 & ")/3,0)"
+End Sub
+
+'============================================================
+' 月份時間軸
+'============================================================
+Private Function BuildColumnDates( _
+    ByVal ws As Worksheet, ByVal headerRow As Long, ByVal forecastRows As Object) As Variant
+
+    Dim result(2 To 19) As Variant
+    Dim key As Variant
+    Dim earliestForecast As Date
+    Dim candidateDate As Date
+    Dim targetMonth As Long
+    Dim c As Long
+
+    For Each key In forecastRows.Keys
+        If earliestForecast = 0 Then
+            earliestForecast = YearMonthKeyToDate(CStr(key))
+        ElseIf YearMonthKeyToDate(CStr(key)) < earliestForecast Then
+            earliestForecast = YearMonthKeyToDate(CStr(key))
+        End If
+    Next key
+
+    If earliestForecast = 0 Then
+        BuildColumnDates = result
+        Exit Function
+    End If
+
+    candidateDate = DateAdd("m", 1, earliestForecast)
+
+    For c = 2 To 19
+        targetMonth = ExtractFirstNumber(GetCellText(ws.Cells(headerRow, c)))
+
+        If targetMonth >= 1 And targetMonth <= 12 Then
+            'VBA 的 And 不會短路判斷；必須分層判斷，避免 c=2 時讀取 result(1)。
+            If c > 2 Then
+                If IsDate(result(c - 1)) Then
+                    candidateDate = DateAdd("m", 1, CDate(result(c - 1)))
+                End If
+            End If
+
+            Do While Month(candidateDate) <> targetMonth
+                candidateDate = DateAdd("m", 1, candidateDate)
+            Loop
+
+            result(c) = candidateDate
+        End If
+    Next c
+
+    BuildColumnDates = result
+End Function
+
+Private Function ExtractReportDate(ByVal sheetName As String) As Date
+    Dim i As Long
+    Dim token As String
+    Dim y As Long, m As Long
+
+    For i = 1 To Len(sheetName) - 5
+        token = Mid$(sheetName, i, 6)
+
+        If IsNumeric(token) Then
+            y = CLng(Left$(token, 4))
+            m = CLng(Right$(token, 2))
+
+            If y >= 1900 And m >= 1 And m <= 12 Then
+                ExtractReportDate = DateSerial(y, m, 1)
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Private Function YearMonthKeyToDate(ByVal key As String) As Date
+    If Len(key) = 6 And IsNumeric(key) Then
+        YearMonthKeyToDate = DateSerial(CLng(Left$(key, 4)), CLng(Right$(key, 2)), 1)
+    End If
+End Function
+
+Private Function FormatYearMonth(ByVal y As Long, ByVal m As Long) As String
+    FormatYearMonth = Format$(y, "0000") & Format$(m, "00")
+End Function
+
+'============================================================
+' 找設備、列標籤及工作表
+'============================================================
+Private Function FindDeviceBlock( _
+    ByVal ws As Worksheet, ByVal displayDeviceName As String, _
+    ByRef startRow As Long, ByRef endRow As Long) As Boolean
+
+    Dim targetName As String
+    Dim r As Long, candidateStart As Long
+    Dim lastRow As Long
+
+    startRow = 0
+    endRow = 0
+    lastRow = ws.Cells(ws.Rows.count, 1).End(xlUp).Row
+
+    If NormalizeText(displayDeviceName) = NormalizeText("焊接Hanger") Then
+        targetName = "Hanger 焊接"
+
+        '附件內第一次出現的 Hanger 焊接才是焊接 Hanger 報表；
+        '第二次出現位於精密車修區塊內。
+        For r = 1 To lastRow
+            If NormalizeText(GetCellText(ws.Cells(r, 1))) = NormalizeText(targetName) Then
+                candidateStart = r
+                'VBA 的 And 不會短路判斷；r=1 時不可讀取第 0 列。
+                If r > 1 Then
+                    If IsMonthHeaderRow(ws, r - 1) Then candidateStart = r - 1
+                End If
+
+                If FindBlockEnd(ws, candidateStart, endRow) Then
+                    startRow = candidateStart
+                    FindDeviceBlock = True
+                    Exit Function
+                End If
+            End If
+        Next r
+
+    Else
+        targetName = displayDeviceName
+
+        For r = 1 To lastRow
+            If NormalizeText(GetCellText(ws.Cells(r, 1))) = NormalizeText(targetName) Then
+                If FindBlockEnd(ws, r, endRow) Then
+                    startRow = r
+                    FindDeviceBlock = True
+                    Exit Function
+                End If
+            End If
+        Next r
+    End If
+End Function
+
+Private Function FindBlockEnd(ByVal ws As Worksheet, ByVal startRow As Long, ByRef endRow As Long) As Boolean
+    Dim r As Long
+    Dim maxSearchRow As Long
+
+    maxSearchRow = Application.Min(ws.Cells(ws.Rows.count, 1).End(xlUp).Row, startRow + 45)
+
+    For r = startRow To maxSearchRow
+        If NormalizeText(GetCellText(ws.Cells(r, 1))) = NormalizeText("產能負荷率") Then
+            endRow = r
+            FindBlockEnd = True
+            Exit Function
+        End If
+    Next r
+End Function
+
+Private Function BuildRowMap(ByVal ws As Worksheet, ByVal startRow As Long, ByVal endRow As Long) As Object
+    Dim result As Object
+    Dim r As Long
+    Dim key As String
+
+    Set result = CreateObject("Scripting.Dictionary")
+    result.CompareMode = vbTextCompare
+
+    For r = startRow To endRow
+        key = NormalizeText(GetCellText(ws.Cells(r, 1)))
+
+        If Len(key) > 0 Then
+            If Not result.Exists(key) Then result.Add key, r
+        End If
+    Next r
+
+    Set BuildRowMap = result
+End Function
+
+Private Function BuildForecastRowMap(ByVal ws As Worksheet, ByVal startRow As Long, ByVal endRow As Long) As Object
+    Dim result As Object
+    Dim r As Long
+    Dim y As Long, m As Long
+    Dim labelText As String
+
+    Set result = CreateObject("Scripting.Dictionary")
+    result.CompareMode = vbTextCompare
+
+    For r = startRow To endRow
+        labelText = GetCellText(ws.Cells(r, 1))
+
+        If TryParseForecastLabel(labelText, y, m) Then
+            result(FormatYearMonth(y, m)) = r
+        End If
+    Next r
+
+    Set BuildForecastRowMap = result
+End Function
+
+Private Function FindMonthHeaderRow(ByVal ws As Worksheet, ByVal startRow As Long, ByVal endRow As Long) As Long
+    Dim r As Long
+
+    For r = startRow To endRow
+        If IsMonthHeaderRow(ws, r) Then
+            FindMonthHeaderRow = r
+            Exit Function
+        End If
+    Next r
+End Function
+
+Private Function BuildPlannedCapacityMap(ByVal ws As Worksheet, ByVal startRow As Long, ByVal endRow As Long) As Object
+    Dim result As Object
+    Dim r As Long
+    Dim slotIndex As Long
+    Dim inCapacitySection As Boolean
+    Dim labelText As String
+    Dim key As String
+
+    Set result = CreateObject("Scripting.Dictionary")
+    result.CompareMode = vbTextCompare
+
+    For r = startRow To endRow
+        labelText = GetCellText(ws.Cells(r, 1))
+        key = NormalizeText(labelText)
+
+        If key = NormalizeText("當月實際下單跟上月預估") Then
+            inCapacitySection = True
+
+        ElseIf key = NormalizeText("當月實際生產產能") Then
+            Exit For
+
+        ElseIf inCapacitySection Then
+            If IsPlannedCapacityCandidate(labelText) Then
+                slotIndex = slotIndex + 1
+                result(CStr(slotIndex)) = r
+            End If
+        End If
+    Next r
+
+    Set BuildPlannedCapacityMap = result
+End Function
+
+Private Function GetCapacitySlotForRow(ByVal capacityMap As Object, ByVal rowNumber As Long) As Long
+    Dim key As Variant
+
+    If capacityMap Is Nothing Then Exit Function
+
+    For Each key In capacityMap.Keys
+        If CLng(capacityMap(key)) = rowNumber Then
+            GetCapacitySlotForRow = CLng(key)
+            Exit Function
+        End If
+    Next key
+End Function
+
+Private Function IsPlannedCapacityCandidate(ByVal labelText As String) As Boolean
+    Dim key As String
+
+    key = NormalizeText(labelText)
+    If Len(key) = 0 Then Exit Function
+
+    '規劃產能區可能出現：
+    '一班產能、兩班產能、三班產能、一班+加班產能、
+    '加班最大產量、7/14討論一個月產量、單純「一班」或「產能」等名稱。
+    If InStr(1, key, NormalizeText("產能"), vbTextCompare) > 0 Then
+        IsPlannedCapacityCandidate = True
+        Exit Function
+    End If
+
+    If InStr(1, key, NormalizeText("產量"), vbTextCompare) > 0 Then
+        IsPlannedCapacityCandidate = True
+        Exit Function
+    End If
+
+    If key = NormalizeText("一班") _
+       Or key = NormalizeText("兩班") _
+       Or key = NormalizeText("三班") Then
+        IsPlannedCapacityCandidate = True
+    End If
+End Function
+
+Private Function FindSheetBySuffix(ByVal wb As Workbook, ByVal suffix As String) As Worksheet
+    Dim ws As Worksheet
+    Dim found As Worksheet
+    Dim matchedCount As Long
+    Dim sheetKey As String, suffixKey As String
+
+    suffixKey = UCase$(Trim$(suffix))
+
+    For Each ws In wb.Worksheets
+        sheetKey = UCase$(Trim$(ws.Name))
+
+        If Len(sheetKey) >= Len(suffixKey) Then
+            If Right$(sheetKey, Len(suffixKey)) = suffixKey Then
+                matchedCount = matchedCount + 1
+                Set found = ws
+            End If
+        End If
+    Next ws
+
+    If matchedCount > 1 Then
+        Err.Raise vbObjectError + 1010, , "找到多張名稱後綴為 " & suffix & " 的分頁，無法判斷來源。"
+    End If
+
+    Set FindSheetBySuffix = found
+End Function
+
+Private Function WorksheetExists(ByVal wb As Workbook, ByVal sheetName As String) As Boolean
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set ws = wb.Worksheets(sheetName)
+    WorksheetExists = Not ws Is Nothing
+    On Error GoTo 0
+End Function
+
+'============================================================
+' 設備清單與排序
+'============================================================
+Private Function GetSortedDevices(ByVal wb As Workbook) As Variant
+    Dim sourceList As Variant
+    Dim result() As Variant
+    Dim wsTemp As Worksheet
+    Dim tempName As String
+    Dim i As Long, itemCount As Long
+
+    '沖壓、自供料依使用者指示排除。
+    sourceList = Array( _
+        "14B", "17B", "19B", "精密車修", "13B", _
+        "2分", "2分半", "2模3", "32B", "36B", "38B", _
+        "22B", "分半車", "10B", "27B", "Hanger", _
+        "焊接Hanger", "彈簧機CS01+CS03", "彈簧機CS02", "24B")
+
+    itemCount = UBound(sourceList) - LBound(sourceList) + 1
+    tempName = "__設備排序_" & Format$(Now, "hhmmss")
+
+    On Error GoTo SortError
+
+    Set wsTemp = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.count))
+    wsTemp.Name = Left$(tempName, 31)
+
+    For i = LBound(sourceList) To UBound(sourceList)
+        wsTemp.Cells(i - LBound(sourceList) + 1, 1).value = sourceList(i)
+    Next i
+
+    wsTemp.Range("A1:A" & itemCount).Sort _
+        Key1:=wsTemp.Range("A1"), _
+        Order1:=xlAscending, _
+        Header:=xlNo, _
+        OrderCustom:=1, _
+        MatchCase:=False, _
+        Orientation:=xlTopToBottom, _
+        SortMethod:=xlPinYin, _
+        DataOption1:=xlSortNormal
+
+    ReDim result(0 To itemCount - 1)
+
+    For i = 1 To itemCount
+        result(i - 1) = CStr(wsTemp.Cells(i, 1).value)
+    Next i
+
+    Application.DisplayAlerts = False
+    wsTemp.Delete
+    Set wsTemp = Nothing
+
+    GetSortedDevices = result
+    Exit Function
+
+SortError:
+    If Not wsTemp Is Nothing Then
+        Application.DisplayAlerts = False
+        wsTemp.Delete
+    End If
+    Err.Raise Err.Number, Err.Source, Err.Description
+End Function
+
+'============================================================
+' 範本複製與版面
+'============================================================
+Private Sub CopyTemplateBlock( _
+    ByVal sourceWS As Worksheet, ByVal sourceStart As Long, ByVal sourceEnd As Long, _
+    ByVal targetWS As Worksheet, ByVal targetStart As Long)
+
+    Dim sourceRange As Range, targetRange As Range
+    Dim r As Long, targetRow As Long
+
+    Set sourceRange = sourceWS.Range(sourceWS.Cells(sourceStart, 1), sourceWS.Cells(sourceEnd, 20))
+    Set targetRange = targetWS.Range(targetWS.Cells(targetStart, 1), _
+                                     targetWS.Cells(targetStart + sourceEnd - sourceStart, 20))
+
+    sourceRange.Copy Destination:=targetRange
+
+    '移除來源公式及外部連結，只保留目前計算結果與格式。
+    targetRange.value = targetRange.value
+
+    For r = sourceStart To sourceEnd
+        targetRow = targetStart + r - sourceStart
+        targetWS.Rows(targetRow).RowHeight = sourceWS.Rows(r).RowHeight
+        targetWS.Rows(targetRow).Hidden = sourceWS.Rows(r).Hidden
+    Next r
+End Sub
+
+Private Sub CopyColumnLayout( _
+    ByVal sourceWS As Worksheet, ByVal targetWS As Worksheet, _
+    ByVal firstColumn As Long, ByVal lastColumn As Long)
+
+    Dim c As Long
+
+    For c = firstColumn To lastColumn
+        targetWS.Columns(c).ColumnWidth = sourceWS.Columns(c).ColumnWidth
+        targetWS.Columns(c).Hidden = sourceWS.Columns(c).Hidden
+    Next c
+End Sub
+
+Private Sub CopyRowValues( _
+    ByVal sourceWS As Worksheet, ByVal sourceRow As Long, _
+    ByVal targetWS As Worksheet, ByVal targetRow As Long, _
+    ByVal firstColumn As Long, ByVal lastColumn As Long)
+
+    Dim c As Long
+    Dim present As Boolean
+    Dim outputValue As Variant
+
+    For c = firstColumn To lastColumn
+        outputValue = GetCellValueForOutput(sourceWS.Cells(sourceRow, c), present)
+
+        If present Then
+            targetWS.Cells(targetRow, c).value = outputValue
+        Else
+            targetWS.Cells(targetRow, c).ClearContents
+        End If
+    Next c
+End Sub
+
+Private Function BuildOutputSheetName(ByVal twSheetName As String) As String
+    Dim result As String
+
+    If UCase$(Right$(Trim$(twSheetName), 2)) = "TW" Then
+        result = Left$(Trim$(twSheetName), Len(Trim$(twSheetName)) - 2) & "合併"
+    Else
+        result = twSheetName & "-合併"
+    End If
+
+    If Len(result) > 31 Then result = Left$(result, 31)
+    BuildOutputSheetName = result
+End Function
+
+'============================================================
+' 儲存格值、文字及分類輔助
+'============================================================
+Private Function GetNumericCellValue(ByVal sourceCell As Range, ByRef hasContent As Boolean) As Double
+    Dim valueData As Variant
+
+    hasContent = CellHasSourceContent(sourceCell)
+    valueData = sourceCell.Value2
+
+    If IsError(valueData) Then
+        GetNumericCellValue = 0
+    ElseIf IsNumeric(valueData) And Len(CStr(valueData)) > 0 Then
+        GetNumericCellValue = CDbl(valueData)
+    Else
+        GetNumericCellValue = 0
+    End If
+End Function
+
+Private Function GetCellValueForOutput(ByVal sourceCell As Range, ByRef hasContent As Boolean) As Variant
+    Dim valueData As Variant
+
+    hasContent = CellHasSourceContent(sourceCell)
+    valueData = sourceCell.Value2
+
+    If IsError(valueData) Then
+        GetCellValueForOutput = 0
+    Else
+        GetCellValueForOutput = valueData
+    End If
+End Function
+
+Private Function CellHasSourceContent(ByVal sourceCell As Range) As Boolean
+    Dim formulaData As Variant
+    Dim valueData As Variant
+
+    formulaData = sourceCell.Formula
+    valueData = sourceCell.Value2
+
+    If IsError(valueData) Or IsError(formulaData) Then
+        CellHasSourceContent = True
+    ElseIf Not IsEmpty(formulaData) And Len(CStr(formulaData)) > 0 Then
+        CellHasSourceContent = True
+    ElseIf Not IsEmpty(valueData) And Len(CStr(valueData)) > 0 Then
+        CellHasSourceContent = True
+    End If
+End Function
+
+Private Function CellHasOutputContent(ByVal targetCell As Range) As Boolean
+    Dim formulaData As Variant
+    Dim valueData As Variant
+
+    formulaData = targetCell.Formula
+    valueData = targetCell.Value2
+
+    If IsError(valueData) Or IsError(formulaData) Then
+        CellHasOutputContent = True
+    ElseIf Not IsEmpty(formulaData) And Len(CStr(formulaData)) > 0 Then
+        CellHasOutputContent = True
+    ElseIf Not IsEmpty(valueData) And Len(CStr(valueData)) > 0 Then
+        CellHasOutputContent = True
+    End If
+End Function
+
+Private Function GetCellText(ByVal sourceCell As Range) As String
+    Dim valueData As Variant
+
+    valueData = sourceCell.Value2
+
+    If IsError(valueData) Or IsEmpty(valueData) Then
+        GetCellText = vbNullString
+    Else
+        GetCellText = CStr(valueData)
+    End If
+End Function
+
+Private Function NormalizeText(ByVal textData As String) As String
+    Dim result As String
+
+    result = Trim$(textData)
+    result = Replace(result, vbCr, vbNullString)
+    result = Replace(result, vbLf, vbNullString)
+    result = Replace(result, vbTab, vbNullString)
+    result = Replace(result, Chr$(160), vbNullString)
+    result = Replace(result, ChrW(&H3000), vbNullString)
+    result = Replace(result, " ", vbNullString)
+
+    NormalizeText = UCase$(result)
+End Function
+
+Private Function IsMonthHeaderRow(ByVal ws As Worksheet, ByVal rowNumber As Long) As Boolean
+    Dim c As Long
+    Dim monthHeaderCount As Long
+    Dim headerText As String
+
+    For c = 2 To 19
+        headerText = NormalizeText(GetCellText(ws.Cells(rowNumber, c)))
+
+        If InStr(1, headerText, NormalizeText("月份下單"), vbTextCompare) > 0 Then
+            monthHeaderCount = monthHeaderCount + 1
+        End If
+    Next c
+
+    If monthHeaderCount >= 3 Then
+        IsMonthHeaderRow = True
+    ElseIf NormalizeText(GetCellText(ws.Cells(rowNumber, 20))) = NormalizeText("3個月平均") Then
+        IsMonthHeaderRow = True
+    End If
+End Function
+
+Private Function IsActualOrderLabel(ByVal labelText As String) As Boolean
+    Dim key As String
+    key = NormalizeText(labelText)
+
+    If Left$(key, Len(NormalizeText("實際下單"))) = NormalizeText("實際下單") _
+       And InStr(1, key, NormalizeText("跟上月預估"), vbTextCompare) = 0 Then
+        IsActualOrderLabel = True
+    End If
+End Function
+
+Private Function TryParseForecastLabel( _
+    ByVal labelText As String, ByRef forecastYear As Long, ByRef forecastMonth As Long) As Boolean
+
+    Dim key As String
+    Dim token As String
+
+    forecastYear = 0
+    forecastMonth = 0
+    key = NormalizeText(labelText)
+
+    If Len(key) < 8 Then Exit Function
+    If Right$(key, Len(NormalizeText("預估"))) <> NormalizeText("預估") Then Exit Function
+
+    token = Left$(key, 6)
+    If Not IsNumeric(token) Then Exit Function
+
+    forecastYear = CLng(Left$(token, 4))
+    forecastMonth = CLng(Right$(token, 2))
+
+    If forecastYear >= 1900 And forecastMonth >= 1 And forecastMonth <= 12 Then
+        TryParseForecastLabel = True
+    End If
+End Function
+
+Private Function ExtractActualMonth(ByVal labelText As String) As Long
+    Dim key As String
+    Dim startPosition As Long, endPosition As Long
+    Dim token As String
+
+    key = NormalizeText(labelText)
+    startPosition = InStr(1, key, NormalizeText("實際下單"), vbTextCompare)
+    endPosition = InStr(1, key, NormalizeText("月份"), vbTextCompare)
+
+    If startPosition > 0 And endPosition > startPosition Then
+        startPosition = startPosition + Len(NormalizeText("實際下單"))
+        token = Mid$(key, startPosition, endPosition - startPosition)
+
+        If IsNumeric(token) Then
+            ExtractActualMonth = CLng(token)
+            If ExtractActualMonth < 1 Or ExtractActualMonth > 12 Then ExtractActualMonth = 0
+        End If
+    End If
+End Function
+
+Private Function ExtractFirstNumber(ByVal textData As String) As Long
+    Dim i As Long
+    Dim ch As String
+    Dim token As String
+
+    For i = 1 To Len(textData)
+        ch = Mid$(textData, i, 1)
+
+        If ch >= "0" And ch <= "9" Then
+            token = token & ch
+        ElseIf Len(token) > 0 Then
+            Exit For
+        End If
+    Next i
+
+    If Len(token) > 0 Then ExtractFirstNumber = CLng(token)
+End Function
+
