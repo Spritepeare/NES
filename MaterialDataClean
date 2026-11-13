@@ -1,0 +1,113 @@
+
+Sub 盤元對照資料清理()
+
+    Dim ws As Worksheet
+    Set ws = ActiveSheet
+
+    Dim data As Variant, result() As Variant
+    Dim lastRow As Long, i As Long, j As Long, k As Long
+    Dim outRow As Long
+    Dim val1 As String, val3 As String
+    Dim tmpB As Variant, tmpC As Variant, tmpD As Variant
+    
+    ' 用於加速上色的 Range 變數
+    Dim colorRng As Range
+
+    ' 加速設置
+    With Application
+        .ScreenUpdating = False
+        .Calculation = xlCalculationManual
+        .EnableEvents = False
+    End With
+
+    ' 取得最後列（以B欄為準）
+    lastRow = ws.Cells(ws.Rows.count, "B").End(xlUp).Row
+    If lastRow < 2 Then GoTo CleanUp
+
+    ' 讀取 A~J 欄資料
+    data = ws.Range("A1:J" & lastRow).value
+    ReDim result(1 To UBound(data, 1), 1 To 10)
+
+    ' 1. 處理標題列
+    outRow = 1
+    For j = 1 To 10
+        result(outRow, j) = data(1, j)
+    Next j
+
+    ' 2. 主迴圈處理數據
+    For i = 2 To UBound(data, 1)
+        val1 = Trim(CStr(data(i, 2))) ' B欄判斷過濾
+        
+        ' 判斷是否保留資料
+        If Not (val1 = "NULL" Or val1 Like "D*" Or val1 Like "WA*" Or _
+                val1 Like "W1*" Or val1 Like "WF*") Then
+            
+            outRow = outRow + 1
+            val3 = Trim(CStr(data(i, 8))) ' H欄判斷交換
+            
+            ' 群組調換邏輯：(B,C,D) -> (H,I,J) -> (E,F,G) -> (B,C,D)
+            ' 目的：B=E組, E=H組, H=B組
+            If val3 <> "" And val3 <> "NULL" Then
+                
+                ' 暫存 B 組 (B, C, D)
+                tmpB = data(i, 2): tmpC = data(i, 3): tmpD = data(i, 4)
+                
+                ' 把 E 組搬到 B 組 (B, C, D = E, F, G)
+                data(i, 2) = data(i, 5): data(i, 3) = data(i, 6): data(i, 4) = data(i, 7)
+                
+                ' 把 H 組搬到 E 組 (E, F, G = H, I, J)
+                data(i, 5) = data(i, 8): data(i, 6) = data(i, 9): data(i, 7) = data(i, 10)
+                
+                ' 把暫存的 B 組搬到 H 組 (H, I, J = 原B, 原C, 原D)
+                data(i, 8) = tmpB: data(i, 9) = tmpC: data(i, 10) = tmpD
+                
+                ' 在 Union 集合中記錄這一列的 H 欄 (寫入後的儲存格)
+                ' 這裡優化：直接在此處建立 Union 避免回寫後重新遍歷
+                If colorRng Is Nothing Then
+                    Set colorRng = ws.Cells(outRow, 8)
+                Else
+                    Set colorRng = Union(colorRng, ws.Cells(outRow, 8))
+                End If
+            End If
+
+            ' 將處理好的 data 行寫入 result 陣列
+            For j = 1 To 10
+                result(outRow, j) = data(i, j)
+            Next j
+        End If
+    Next i
+
+    ' 3. 資料回寫
+    ' 先徹底清除 A:J 的內容與顏色，防止舊資料干擾
+    ws.Range("A:J").Clear
+    ws.Range("A1").Resize(outRow, 10).value = result
+
+    ' 4. 一次性執行上色
+    If Not colorRng Is Nothing Then
+        colorRng.Interior.Color = RGB(255, 255, 0)
+    End If
+
+    ' 5. 顏色排序 (黃色優先)
+    If outRow > 1 Then
+        With ws.Sort
+            .SortFields.Clear
+            .SortFields.Add( _
+                key:=ws.Range("H2:H" & outRow), _
+                SortOn:=xlSortOnCellColor, _
+                Order:=xlAscending).SortOnValue.Color = RGB(255, 255, 0)
+            .SetRange ws.Range("A1:J" & outRow)
+            .Header = xlYes
+            .Apply
+        End With
+    End If
+
+CleanUp:
+    With Application
+        .ScreenUpdating = True
+        .Calculation = xlCalculationAutomatic
+        .EnableEvents = True
+    End With
+
+    MsgBox "群組調換與優化完成！" & vbCrLf & "剩餘資料列數：" & outRow - 1
+
+End Sub
