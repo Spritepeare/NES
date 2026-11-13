@@ -1,0 +1,1073 @@
+Option Explicit
+
+'============================================================
+' 未來訂單模擬 - 動態通用版
+'
+' 核心規則：
+' 1. 第1張工作表：海運天數對照。
+' 2. 第2張工作表：產品與庫存資料，資料從第4列開始。
+' 3. 第3列中找到「起始欄」，其右邊第一個數字週次為第一個模擬週。
+' 4. 週欄一路依第2列連續日期讀取；第3列即使標示「輔助欄」也視為後續週數。
+' 5. 第2列日期用來辨識週欄範圍；第3列已有週碼時優先採用，輔助欄則由前一週自動續編。
+' 6. 最後資料列自動判斷，不再固定1953列。
+' 7. 輸出TW/MX/VN時，起始欄清空；所有週欄（包含原「輔助欄」）都可寫入下單量。
+'
+' 重要：
+' - 下單週早於第一個模擬週：視為第一個模擬週下單且到貨。
+' - 產地依「實際到貨週」與K欄切換週判斷。
+' - K空白或0：全程TW。
+' - M欄="*"才處理；L欄不影響。
+' - O欄空白、非數字、<=0：批量=100。
+'============================================================
+
+Private Const FIRST_DATA_ROW As Long = 4
+Private Const ARRIVE_BEFORE_BREAK_WEEKS As Long = 5
+Private Const EXTRA_PRODUCTION_DAYS As Double = 20#
+Private Const DEFAULT_BATCH As Double = 100#
+Private Const NO_SWITCH_WEEK As Long = -1
+Private Const ZERO_TOLERANCE As Double = 0.0000001
+
+Public Sub Forecast_Order()
+
+    Dim wb As Workbook
+    Dim wsSea As Worksheet
+    Dim wsSource As Worksheet
+    Dim wsTW As Worksheet
+    Dim wsMX As Worksheet
+    Dim wsVN As Worksheet
+
+    Dim seaDaysMap As Object
+    Dim metaData As Variant
+    Dim stockData As Variant
+    Dim outputTW As Variant
+    Dim outputMX As Variant
+    Dim outputVN As Variant
+    Dim weekSerials() As Long
+    Dim weekLabels() As String
+    Dim curve() As Double
+
+    Dim startStockCol As Long
+    Dim firstWeekCol As Long
+    Dim lastWeekCol As Long
+    Dim lastClearCol As Long
+    Dim lastDataRow As Long
+    Dim weekCount As Long
+    Dim rowCount As Long
+
+    Dim rowIndex As Long
+    Dim weekIndex As Long
+    Dim sheetRow As Long
+
+    Dim leadTimeDays As Double
+    Dim warehouse As String
+    Dim switchedOrigin As String
+    Dim switchWeekSerial As Long
+    Dim batchSize As Double
+
+    Dim processedProducts As Long
+    Dim createdOrders As Long
+    Dim forcedToFirstWeekOrders As Long
+
+    Dim oldCalculation As XlCalculation
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+    Dim oldDisplayAlerts As Boolean
+    Dim oldStatusBar As Variant
+    Dim startedAt As Double
+    Dim elapsedSeconds As Double
+
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    On Error GoTo ErrorHandler
+
+    startedAt = Timer
+
+    oldCalculation = Application.Calculation
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+    oldDisplayAlerts = Application.DisplayAlerts
+    oldStatusBar = Application.StatusBar
+
+    Set wb = ThisWorkbook
+
+    If wb.Worksheets.count < 2 Then
+        Err.Raise vbObjectError + 1000, "Forecast_Order", _
+                  "活頁簿至少需要兩個工作表：海運天數對照與產品資料。"
+    End If
+
+    Set wsSea = wb.Worksheets(1)
+    Set wsSource = wb.Worksheets(2)
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    Application.StatusBar = "正在辨識時間軸與讀取資料……"
+
+    '--- 動態辨識範圍 ---
+    startStockCol = FindStartStockColumn(wsSource)
+    firstWeekCol = startStockCol + 1
+    lastWeekCol = FindLastWeekColumn(wsSource, firstWeekCol)
+    lastClearCol = FindLastOutputColumn(wsSource, startStockCol)
+    lastDataRow = FindLastDataRow(wsSource)
+
+    If lastDataRow < FIRST_DATA_ROW Then
+        Err.Raise vbObjectError + 1001, "Forecast_Order", _
+                  "找不到第4列之後的產品資料。"
+    End If
+
+    weekCount = lastWeekCol - firstWeekCol + 1
+    rowCount = lastDataRow - FIRST_DATA_ROW + 1
+
+    If weekCount <= 0 Then
+        Err.Raise vbObjectError + 1002, "Forecast_Order", _
+                  "找不到有效的週時間軸。"
+    End If
+
+    ReDim weekSerials(0 To weekCount - 1)
+    ReDim weekLabels(0 To weekCount - 1)
+    BuildWeekAxis wsSource, firstWeekCol, lastWeekCol, weekSerials, weekLabels
+
+    Set seaDaysMap = BuildSeaDaysMap(wsSea)
+
+    metaData = wsSource.Range("H" & FIRST_DATA_ROW & ":O" & lastDataRow).Value2
+
+    'stockData第1欄為「起始欄」，第2欄開始才是真正週欄。
+    stockData = wsSource.Range( _
+        wsSource.Cells(FIRST_DATA_ROW, startStockCol), _
+        wsSource.Cells(lastDataRow, lastWeekCol)).Value2
+
+    ReDim outputTW(1 To rowCount, 1 To weekCount)
+    ReDim outputMX(1 To rowCount, 1 To weekCount)
+    ReDim outputVN(1 To rowCount, 1 To weekCount)
+    ReDim curve(0 To weekCount - 1)
+
+    For rowIndex = 1 To rowCount
+
+        sheetRow = FIRST_DATA_ROW + rowIndex - 1
+
+        'metaData：
+        '1=H LT
+        '2=I 倉庫
+        '3=J 切換後產地
+        '4=K 切換週
+        '5=L
+        '6=M 預估篩選
+        '7=N
+        '8=O 批量
+        If Trim$(CStr(metaData(rowIndex, 6))) = "*" Then
+
+            processedProducts = processedProducts + 1
+
+            If processedProducts Mod 25 = 0 Then
+                Application.StatusBar = _
+                    "模擬中：已處理 " & processedProducts & _
+                    " 筆，目前工作表第 " & sheetRow & " 列……"
+            End If
+
+            leadTimeDays = ReadLeadTime(metaData(rowIndex, 1), sheetRow)
+            warehouse = NormalizeWarehouse(metaData(rowIndex, 2), sheetRow)
+            switchWeekSerial = ParseSwitchWeek(metaData(rowIndex, 4), sheetRow)
+
+            If switchWeekSerial = NO_SWITCH_WEEK Then
+                switchedOrigin = "TW"
+            Else
+                switchedOrigin = NormalizeOrigin(metaData(rowIndex, 3), sheetRow)
+            End If
+
+            batchSize = ReadBatchSize(metaData(rowIndex, 8))
+
+            '先驗證起始欄。
+            Call ReadStockValue( _
+                stockData(rowIndex, 1), _
+                sheetRow, _
+                "起始欄")
+
+            '真正斷線判斷從第一個週欄開始。
+            For weekIndex = 0 To weekCount - 1
+                curve(weekIndex) = ReadStockValue( _
+                    stockData(rowIndex, weekIndex + 2), _
+                    sheetRow, _
+                    weekLabels(weekIndex))
+            Next weekIndex
+
+            SimulateOneProduct _
+                sheetRow:=sheetRow, _
+                rowIndex:=rowIndex, _
+                curve:=curve, _
+                leadTimeDays:=leadTimeDays, _
+                warehouse:=warehouse, _
+                switchedOrigin:=switchedOrigin, _
+                switchWeekSerial:=switchWeekSerial, _
+                batchSize:=batchSize, _
+                seaDaysMap:=seaDaysMap, _
+                weekSerials:=weekSerials, _
+                outputTW:=outputTW, _
+                outputMX:=outputMX, _
+                outputVN:=outputVN, _
+                createdOrders:=createdOrders, _
+                forcedToFirstWeekOrders:=forcedToFirstWeekOrders
+        End If
+    Next rowIndex
+
+    Application.StatusBar = "正在建立TW、MX、VN輸出工作表……"
+
+    DeleteSheetIfExists wb, "TW"
+    DeleteSheetIfExists wb, "MX"
+    DeleteSheetIfExists wb, "VN"
+
+    Set wsTW = CopyOutputSheet(wsSource, "TW")
+    Set wsMX = CopyOutputSheet(wsSource, "MX")
+    Set wsVN = CopyOutputSheet(wsSource, "VN")
+
+    WriteOutput wsTW, outputTW, startStockCol, firstWeekCol, lastWeekCol, lastClearCol, lastDataRow
+    WriteOutput wsMX, outputMX, startStockCol, firstWeekCol, lastWeekCol, lastClearCol, lastDataRow
+    WriteOutput wsVN, outputVN, startStockCol, firstWeekCol, lastWeekCol, lastClearCol, lastDataRow
+
+    elapsedSeconds = ElapsedTimeSeconds(startedAt)
+
+CleanExit:
+    Application.Calculation = oldCalculation
+    Application.ScreenUpdating = oldScreenUpdating
+    Application.EnableEvents = oldEnableEvents
+    Application.DisplayAlerts = oldDisplayAlerts
+    Application.StatusBar = oldStatusBar
+
+    If Err.Number = 0 Then
+        MsgBox _
+            "未來訂單模擬完成。" & vbCrLf & vbCrLf & _
+            "時間軸：" & weekLabels(0) & " ～ " & weekLabels(weekCount - 1) & vbCrLf & _
+            "週數：" & Format$(weekCount, "#,##0") & " 週" & vbCrLf & _
+            "資料範圍：第 " & FIRST_DATA_ROW & " ～ " & lastDataRow & " 列" & vbCrLf & _
+            "需預估產品：" & Format$(processedProducts, "#,##0") & " 筆" & vbCrLf & _
+            "建立訂單批次：" & Format$(createdOrders, "#,##0") & " 批" & vbCrLf & _
+            "下單週早於時間軸而改在第一週下單/到貨：" & _
+                Format$(forcedToFirstWeekOrders, "#,##0") & " 批" & vbCrLf & _
+            "執行時間：約 " & Format$(elapsedSeconds, "0.0") & " 秒", _
+            vbInformation, _
+            "模擬完成"
+    End If
+
+    Exit Sub
+
+ErrorHandler:
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+
+    On Error Resume Next
+    Application.Calculation = oldCalculation
+    Application.ScreenUpdating = oldScreenUpdating
+    Application.EnableEvents = oldEnableEvents
+    Application.DisplayAlerts = oldDisplayAlerts
+    Application.StatusBar = oldStatusBar
+    On Error GoTo 0
+
+    MsgBox _
+        "模擬已停止，未建立完整的輸出結果。" & vbCrLf & vbCrLf & _
+        errorDescription & vbCrLf & vbCrLf & _
+        "錯誤代碼：" & CStr(errorNumber), _
+        vbCritical, _
+        "未來訂單模擬錯誤"
+End Sub
+
+Private Sub SimulateOneProduct( _
+    ByVal sheetRow As Long, _
+    ByVal rowIndex As Long, _
+    ByRef curve() As Double, _
+    ByVal leadTimeDays As Double, _
+    ByVal warehouse As String, _
+    ByVal switchedOrigin As String, _
+    ByVal switchWeekSerial As Long, _
+    ByVal batchSize As Double, _
+    ByVal seaDaysMap As Object, _
+    ByRef weekSerials() As Long, _
+    ByRef outputTW As Variant, _
+    ByRef outputMX As Variant, _
+    ByRef outputVN As Variant, _
+    ByRef createdOrders As Long, _
+    ByRef forcedToFirstWeekOrders As Long)
+
+    Dim breakWeekIndex As Long
+    Dim newBreakWeekIndex As Long
+    Dim targetArrivalIndex As Long
+    Dim actualArrivalIndex As Long
+    Dim calculatedOrderIndex As Long
+    Dim actualOrderIndex As Long
+
+    Dim preliminaryOrigin As String
+    Dim actualOrigin As String
+    Dim seaDays As Double
+    Dim totalLeadWeeks As Long
+    Dim requiredQuantity As Double
+    Dim orderQuantity As Double
+    Dim weekIndex As Long
+    Dim weekCount As Long
+
+    weekCount = UBound(curve) - LBound(curve) + 1
+
+    Do
+        breakWeekIndex = FindFirstNegativeWeek(curve)
+        If breakWeekIndex < 0 Then Exit Do
+
+        targetArrivalIndex = breakWeekIndex - ARRIVE_BEFORE_BREAK_WEEKS
+
+        '若目標到貨週早於整個時間軸，
+        '則下單週一定也早於時間軸，因此直接套用「第一週下單且到貨」規則。
+        If targetArrivalIndex < 0 Then
+
+            actualOrderIndex = 0
+            actualArrivalIndex = 0
+            actualOrigin = GetArrivalOriginBySerial( _
+                weekSerials(actualArrivalIndex), _
+                switchedOrigin, _
+                switchWeekSerial)
+
+            '仍驗證該產地/倉庫的海運資料是否存在。
+            Call GetSeaDays( _
+                seaDaysMap, _
+                actualOrigin, _
+                warehouse, _
+                sheetRow)
+
+            forcedToFirstWeekOrders = forcedToFirstWeekOrders + 1
+
+        Else
+
+            '目標到貨週一定不會晚於斷線週，因此正常情況下不會超出時間軸。
+            If targetArrivalIndex > weekCount - 1 Then Exit Do
+
+            preliminaryOrigin = GetArrivalOriginBySerial( _
+                weekSerials(targetArrivalIndex), _
+                switchedOrigin, _
+                switchWeekSerial)
+
+            seaDays = GetSeaDays( _
+                seaDaysMap, _
+                preliminaryOrigin, _
+                warehouse, _
+                sheetRow)
+
+            totalLeadWeeks = CeilingToLong( _
+                (leadTimeDays + EXTRA_PRODUCTION_DAYS + seaDays) / 7#)
+
+            calculatedOrderIndex = targetArrivalIndex - totalLeadWeeks
+
+            If calculatedOrderIndex < 0 Then
+
+                '依已確認規則：
+                '下單週早於第一週 → 視為第一週下單且第一週到貨。
+                actualOrderIndex = 0
+                actualArrivalIndex = 0
+                actualOrigin = GetArrivalOriginBySerial( _
+                    weekSerials(actualArrivalIndex), _
+                    switchedOrigin, _
+                    switchWeekSerial)
+
+                Call GetSeaDays( _
+                    seaDaysMap, _
+                    actualOrigin, _
+                    warehouse, _
+                    sheetRow)
+
+                forcedToFirstWeekOrders = forcedToFirstWeekOrders + 1
+
+            Else
+                actualOrderIndex = calculatedOrderIndex
+                actualArrivalIndex = targetArrivalIndex
+                actualOrigin = preliminaryOrigin
+            End If
+        End If
+
+        If actualArrivalIndex > weekCount - 1 Then Exit Do
+        If actualOrderIndex > weekCount - 1 Then Exit Do
+
+        '要讓原本的斷線週至少推遲1週，
+        '最小需求量就是補到原斷線週>=0，再無條件進到最小批量倍數。
+        requiredQuantity = -curve(breakWeekIndex)
+        orderQuantity = RoundUpToBatch(requiredQuantity, batchSize)
+
+        For weekIndex = actualArrivalIndex To weekCount - 1
+
+            curve(weekIndex) = curve(weekIndex) + orderQuantity
+
+            If Abs(curve(weekIndex)) < ZERO_TOLERANCE Then
+                curve(weekIndex) = 0#
+            End If
+        Next weekIndex
+
+        Select Case actualOrigin
+
+            Case "TW"
+                outputTW(rowIndex, actualOrderIndex + 1) = _
+                    EmptyToZero(outputTW(rowIndex, actualOrderIndex + 1)) + orderQuantity
+
+            Case "MX"
+                outputMX(rowIndex, actualOrderIndex + 1) = _
+                    EmptyToZero(outputMX(rowIndex, actualOrderIndex + 1)) + orderQuantity
+
+            Case "VN"
+                outputVN(rowIndex, actualOrderIndex + 1) = _
+                    EmptyToZero(outputVN(rowIndex, actualOrderIndex + 1)) + orderQuantity
+
+            Case Else
+                Err.Raise vbObjectError + 1010, "SimulateOneProduct", _
+                          "第 " & sheetRow & " 列：無法辨識訂單產地「" & actualOrigin & "」。"
+        End Select
+
+        createdOrders = createdOrders + 1
+
+        newBreakWeekIndex = FindFirstNegativeWeek(curve)
+
+        If newBreakWeekIndex >= 0 Then
+            If newBreakWeekIndex <= breakWeekIndex Then
+                Err.Raise vbObjectError + 1011, "SimulateOneProduct", _
+                          "第 " & sheetRow & " 列：下單後斷線週沒有往後推，請檢查批量或庫存資料。"
+            End If
+        End If
+    Loop
+End Sub
+
+'============================================================
+' 動態範圍與週時間軸
+'============================================================
+
+Private Function FindStartStockColumn(ByVal ws As Worksheet) As Long
+
+    Dim foundCell As Range
+
+    Set foundCell = ws.Rows(3).Find( _
+        What:="起始欄", _
+        After:=ws.Cells(3, 1), _
+        LookIn:=xlValues, _
+        LookAt:=xlWhole, _
+        SearchOrder:=xlByColumns, _
+        SearchDirection:=xlNext, _
+        MatchCase:=False)
+
+    If foundCell Is Nothing Then
+        Err.Raise vbObjectError + 1100, "FindStartStockColumn", _
+                  "第3列找不到「起始欄」標題。"
+    End If
+
+    FindStartStockColumn = foundCell.Column
+End Function
+
+Private Function FindLastWeekColumn( _
+    ByVal ws As Worksheet, _
+    ByVal firstWeekCol As Long) As Long
+
+    Dim col As Long
+    Dim foundCount As Long
+    Dim headerDate As Variant
+
+    '只要第2列仍有連續日期，就視為時間軸的一部分。
+    '因此第3列即使寫「輔助欄」，也會繼續納入模擬。
+    col = firstWeekCol
+
+    Do While col <= ws.Columns.count
+
+        headerDate = ws.Cells(2, col).value
+
+        If IsError(headerDate) Then Exit Do
+        If Len(Trim$(CStr(headerDate))) = 0 Then Exit Do
+        If Not IsDate(headerDate) And Not IsNumeric(headerDate) Then Exit Do
+
+        foundCount = foundCount + 1
+        col = col + 1
+    Loop
+
+    If foundCount = 0 Then
+        Err.Raise vbObjectError + 1101, "FindLastWeekColumn", _
+                  "「起始欄」右側找不到有效的日期時間軸。"
+    End If
+
+    FindLastWeekColumn = firstWeekCol + foundCount - 1
+End Function
+
+Private Function FindLastOutputColumn( _
+    ByVal ws As Worksheet, _
+    ByVal startStockCol As Long) As Long
+
+    Dim foundCell As Range
+
+    Set foundCell = ws.Range( _
+        ws.Cells(3, startStockCol), _
+        ws.Cells(3, ws.Columns.count)).Find( _
+            What:="*", _
+            After:=ws.Cells(3, startStockCol), _
+            LookIn:=xlValues, _
+            LookAt:=xlPart, _
+            SearchOrder:=xlByColumns, _
+            SearchDirection:=xlPrevious, _
+            MatchCase:=False)
+
+    If foundCell Is Nothing Then
+        FindLastOutputColumn = startStockCol
+    Else
+        FindLastOutputColumn = foundCell.Column
+    End If
+End Function
+
+Private Function FindLastDataRow(ByVal ws As Worksheet) As Long
+
+    Dim searchRange As Range
+    Dim foundCell As Range
+
+    '只看A:O產品資料區，避免右方週欄或格式把最後列撐大。
+    Set searchRange = ws.Range("A:O")
+
+    Set foundCell = searchRange.Find( _
+        What:="*", _
+        After:=searchRange.Cells(1, 1), _
+        LookIn:=xlValues, _
+        LookAt:=xlPart, _
+        SearchOrder:=xlByRows, _
+        SearchDirection:=xlPrevious, _
+        MatchCase:=False)
+
+    If foundCell Is Nothing Then
+        FindLastDataRow = 0
+    Else
+        FindLastDataRow = foundCell.Row
+    End If
+End Function
+
+Private Sub BuildWeekAxis( _
+    ByVal ws As Worksheet, _
+    ByVal firstWeekCol As Long, _
+    ByVal lastWeekCol As Long, _
+    ByRef weekSerials() As Long, _
+    ByRef weekLabels() As String)
+
+    Dim col As Long
+    Dim idx As Long
+    Dim currentWeek As Long
+    Dim previousWeek As Long
+    Dim currentYear As Long
+    Dim previousYear As Long
+    Dim firstDate As Date
+    Dim currentDate As Date
+    Dim previousDate As Date
+    Dim firstWeek As Long
+    Dim row3Value As Variant
+    Dim hasExplicitWeek As Boolean
+
+    row3Value = ws.Cells(3, firstWeekCol).Value2
+
+    If Not IsNumeric(row3Value) Then
+        Err.Raise vbObjectError + 1110, "BuildWeekAxis", _
+                  "第一個模擬週 " & ws.Cells(3, firstWeekCol).Address(False, False) & _
+                  " 必須是數字週次。"
+    End If
+
+    firstWeek = CLng(row3Value)
+
+    If firstWeek < 1 Or firstWeek > 53 Then
+        Err.Raise vbObjectError + 1111, "BuildWeekAxis", _
+                  "第一個模擬週的週次必須介於1～53。"
+    End If
+
+    firstDate = ReadHeaderDate(ws.Cells(2, firstWeekCol).value, firstWeekCol)
+    currentYear = InferWeekYear(firstDate, firstWeek)
+
+    previousWeek = 0
+    previousYear = currentYear
+    previousDate = firstDate
+
+    For col = firstWeekCol To lastWeekCol
+
+        idx = col - firstWeekCol
+        currentDate = ReadHeaderDate(ws.Cells(2, col).value, col)
+        row3Value = ws.Cells(3, col).Value2
+        hasExplicitWeek = False
+
+        If Not IsError(row3Value) Then
+            If Len(Trim$(CStr(row3Value))) > 0 And IsNumeric(row3Value) Then
+                currentWeek = CLng(row3Value)
+                If currentWeek >= 1 And currentWeek <= 53 Then
+                    hasExplicitWeek = True
+                End If
+            End If
+        End If
+
+        If idx = 0 Then
+
+            currentWeek = firstWeek
+            currentYear = InferWeekYear(currentDate, currentWeek)
+
+        ElseIf hasExplicitWeek Then
+
+            '第3列有正式數字週碼時，以檔案上的週碼為準。
+            If currentWeek = previousWeek + 1 Then
+                currentYear = previousYear
+
+            ElseIf currentWeek = 1 And previousWeek >= 52 Then
+                currentYear = previousYear + 1
+
+            Else
+                Err.Raise vbObjectError + 1112, "BuildWeekAxis", _
+                          "第3列週次不連續：" & _
+                          ws.Cells(3, col - 1).Address(False, False) & "=" & previousWeek & _
+                          "，" & ws.Cells(3, col).Address(False, False) & "=" & currentWeek & "。"
+            End If
+
+        Else
+
+            '第3列為「輔助欄」或其他文字時，
+            '直接視為前一週的後續週數。
+            currentWeek = previousWeek + 1
+            currentYear = previousYear
+
+            '若延伸週跨到新年度，依日期年份變化自動由W52/W53轉到W01。
+            If Year(currentDate) > Year(previousDate) And previousWeek >= 52 Then
+                currentWeek = 1
+                currentYear = previousYear + 1
+            ElseIf currentWeek > 53 Then
+                currentWeek = 1
+                currentYear = previousYear + 1
+            End If
+        End If
+
+        weekSerials(idx) = MakeWeekSerial(currentYear, currentWeek)
+        weekLabels(idx) = CStr(currentYear) & "W" & Format$(currentWeek, "00")
+
+        previousWeek = currentWeek
+        previousYear = currentYear
+        previousDate = currentDate
+    Next col
+End Sub
+
+Private Function ReadHeaderDate( _
+    ByVal value As Variant, _
+    ByVal columnNumber As Long) As Date
+
+    If IsError(value) Then
+        Err.Raise vbObjectError + 1111, "ReadHeaderDate", _
+                  "第2列 " & ColumnLetter(columnNumber) & " 欄日期為Excel錯誤值。"
+    End If
+
+    If Not IsDate(value) And Not IsNumeric(value) Then
+        Err.Raise vbObjectError + 1112, "ReadHeaderDate", _
+                  "第2列 " & ColumnLetter(columnNumber) & _
+                  " 欄必須有可辨識的日期，才能判斷時間軸年份。"
+    End If
+
+    ReadHeaderDate = CDate(value)
+End Function
+
+Private Function InferWeekYear( _
+    ByVal weekDate As Date, _
+    ByVal weekNumber As Long) As Long
+
+    Dim y As Long
+    y = Year(weekDate)
+
+    '例如2027W01的週一可能是2026/12/28。
+    If weekNumber <= 2 And Month(weekDate) = 12 Then
+        y = y + 1
+
+    '反向保護：若W52/W53的日期落在1月初，視為前一年。
+    ElseIf weekNumber >= 52 And Month(weekDate) = 1 Then
+        y = y - 1
+    End If
+
+    InferWeekYear = y
+End Function
+
+Private Function MakeWeekSerial( _
+    ByVal yearValue As Long, _
+    ByVal weekValue As Long) As Long
+
+    MakeWeekSerial = yearValue * 100& + weekValue
+End Function
+
+Private Function ColumnLetter(ByVal columnNumber As Long) As String
+    ColumnLetter = Split(Cells(1, columnNumber).Address(True, False), "$")(0)
+End Function
+
+'============================================================
+' 海運天數
+'============================================================
+
+Private Function BuildSeaDaysMap(ByVal ws As Worksheet) As Object
+
+    Dim result As Object
+    Dim lastWarehouseCol As Long
+    Dim lastOriginRow As Long
+    Dim originRow As Long
+    Dim warehouseCol As Long
+
+    Dim origin As String
+    Dim warehouse As String
+    Dim key As String
+    Dim cellValue As Variant
+
+    Set result = CreateObject("Scripting.Dictionary")
+    result.CompareMode = vbTextCompare
+
+    lastWarehouseCol = ws.Cells(1, ws.Columns.count).End(xlToLeft).Column
+    lastOriginRow = ws.Cells(ws.Rows.count, 1).End(xlUp).Row
+
+    If lastWarehouseCol < 2 Or lastOriginRow < 2 Then
+        Err.Raise vbObjectError + 1020, "BuildSeaDaysMap", _
+                  "海運天數對照表沒有足夠的產地或倉庫資料。"
+    End If
+
+    For originRow = 2 To lastOriginRow
+
+        origin = UCase$(Trim$(CStr(ws.Cells(originRow, 1).Value2)))
+
+        If origin <> "" Then
+
+            Select Case origin
+                Case "TW", "MX", "VN"
+                    '有效產地。
+                Case Else
+                    Err.Raise vbObjectError + 1021, "BuildSeaDaysMap", _
+                              "海運天數對照表A" & originRow & _
+                              " 的產地必須為TW、MX或VN，目前為「" & origin & "」。"
+            End Select
+
+            For warehouseCol = 2 To lastWarehouseCol
+
+                warehouse = UCase$(Trim$(CStr(ws.Cells(1, warehouseCol).Value2)))
+
+                If warehouse <> "" Then
+
+                    cellValue = ws.Cells(originRow, warehouseCol).Value2
+
+                    If Not IsError(cellValue) Then
+                        If Len(Trim$(CStr(cellValue))) > 0 And IsNumeric(cellValue) Then
+                            key = MakeSeaKey(origin, warehouse)
+                            result(key) = CDbl(cellValue)
+                        End If
+                    End If
+                End If
+            Next warehouseCol
+        End If
+    Next originRow
+
+    Set BuildSeaDaysMap = result
+End Function
+
+Private Function GetSeaDays( _
+    ByVal seaDaysMap As Object, _
+    ByVal origin As String, _
+    ByVal warehouse As String, _
+    ByVal sheetRow As Long) As Double
+
+    Dim key As String
+
+    key = MakeSeaKey(origin, warehouse)
+
+    If Not seaDaysMap.Exists(key) Then
+        Err.Raise vbObjectError + 1030, "GetSeaDays", _
+                  "第 " & sheetRow & " 列：找不到「" & origin & _
+                  " → " & warehouse & "」的海運天數，或該儲存格為空白/非數字。"
+    End If
+
+    GetSeaDays = CDbl(seaDaysMap(key))
+End Function
+
+Private Function MakeSeaKey( _
+    ByVal origin As String, _
+    ByVal warehouse As String) As String
+
+    MakeSeaKey = UCase$(Trim$(origin)) & Chr$(30) & UCase$(Trim$(warehouse))
+End Function
+
+'============================================================
+' 產品欄位讀取
+'============================================================
+
+Private Function ReadLeadTime( _
+    ByVal value As Variant, _
+    ByVal sheetRow As Long) As Double
+
+    If IsError(value) Then
+        Err.Raise vbObjectError + 1040, "ReadLeadTime", _
+                  "第 " & sheetRow & " 列：H欄LT為Excel錯誤值。"
+    End If
+
+    If Len(Trim$(CStr(value))) = 0 Or Not IsNumeric(value) Then
+        Err.Raise vbObjectError + 1041, "ReadLeadTime", _
+                  "第 " & sheetRow & " 列：H欄LT必須為數字且不可空白。"
+    End If
+
+    ReadLeadTime = CDbl(value)
+
+    If ReadLeadTime < 0# Then
+        Err.Raise vbObjectError + 1042, "ReadLeadTime", _
+                  "第 " & sheetRow & " 列：H欄LT不可小於0。"
+    End If
+End Function
+
+Private Function ReadBatchSize(ByVal value As Variant) As Double
+
+    If IsError(value) Then
+        ReadBatchSize = DEFAULT_BATCH
+    ElseIf Len(Trim$(CStr(value))) = 0 Then
+        ReadBatchSize = DEFAULT_BATCH
+    ElseIf Not IsNumeric(value) Then
+        ReadBatchSize = DEFAULT_BATCH
+    ElseIf CDbl(value) <= 0# Then
+        ReadBatchSize = DEFAULT_BATCH
+    Else
+        ReadBatchSize = CDbl(value)
+    End If
+End Function
+
+Private Function NormalizeWarehouse( _
+    ByVal value As Variant, _
+    ByVal sheetRow As Long) As String
+
+    If IsError(value) Then
+        Err.Raise vbObjectError + 1050, "NormalizeWarehouse", _
+                  "第 " & sheetRow & " 列：I欄倉庫為Excel錯誤值。"
+    End If
+
+    NormalizeWarehouse = UCase$(Trim$(CStr(value)))
+
+    If NormalizeWarehouse = "" Or NormalizeWarehouse = "0" Then
+        Err.Raise vbObjectError + 1051, "NormalizeWarehouse", _
+                  "第 " & sheetRow & " 列：I欄倉庫不可空白。"
+    End If
+End Function
+
+Private Function NormalizeOrigin( _
+    ByVal value As Variant, _
+    ByVal sheetRow As Long) As String
+
+    If IsError(value) Then
+        Err.Raise vbObjectError + 1060, "NormalizeOrigin", _
+                  "第 " & sheetRow & " 列：J欄產地為Excel錯誤值。"
+    End If
+
+    NormalizeOrigin = UCase$(Trim$(CStr(value)))
+
+    Select Case NormalizeOrigin
+        Case "TW", "MX", "VN"
+            '有效。
+        Case Else
+            Err.Raise vbObjectError + 1061, "NormalizeOrigin", _
+                      "第 " & sheetRow & _
+                      " 列：J欄產地必須為TW、MX或VN，目前為「" & CStr(value) & "」。"
+    End Select
+End Function
+
+Private Function ParseSwitchWeek( _
+    ByVal value As Variant, _
+    ByVal sheetRow As Long) As Long
+
+    Dim textValue As String
+    Dim yearValue As Long
+    Dim weekValue As Long
+
+    If IsError(value) Then
+        Err.Raise vbObjectError + 1070, "ParseSwitchWeek", _
+                  "第 " & sheetRow & " 列：K欄切換週為Excel錯誤值。"
+    End If
+
+    textValue = UCase$(Trim$(CStr(value)))
+
+    If textValue = "" Or textValue = "0" Then
+        ParseSwitchWeek = NO_SWITCH_WEEK
+        Exit Function
+    End If
+
+    If Len(textValue) <> 7 Or Mid$(textValue, 5, 1) <> "W" Then
+        Err.Raise vbObjectError + 1071, "ParseSwitchWeek", _
+                  "第 " & sheetRow & _
+                  " 列：K欄格式必須為YYYYWww，例如2026W40。"
+    End If
+
+    If Not IsNumeric(Left$(textValue, 4)) Or _
+       Not IsNumeric(Right$(textValue, 2)) Then
+
+        Err.Raise vbObjectError + 1072, "ParseSwitchWeek", _
+                  "第 " & sheetRow & _
+                  " 列：K欄格式必須為YYYYWww，例如2026W40。"
+    End If
+
+    yearValue = CLng(Left$(textValue, 4))
+    weekValue = CLng(Right$(textValue, 2))
+
+    If weekValue < 1 Or weekValue > 53 Then
+        Err.Raise vbObjectError + 1073, "ParseSwitchWeek", _
+                  "第 " & sheetRow & " 列：K欄週數必須介於01～53。"
+    End If
+
+    ParseSwitchWeek = MakeWeekSerial(yearValue, weekValue)
+End Function
+
+Private Function GetArrivalOriginBySerial( _
+    ByVal arrivalWeekSerial As Long, _
+    ByVal switchedOrigin As String, _
+    ByVal switchWeekSerial As Long) As String
+
+    If switchWeekSerial = NO_SWITCH_WEEK Then
+        GetArrivalOriginBySerial = "TW"
+        Exit Function
+    End If
+
+    If arrivalWeekSerial >= switchWeekSerial Then
+        GetArrivalOriginBySerial = switchedOrigin
+    Else
+        GetArrivalOriginBySerial = "TW"
+    End If
+End Function
+
+Private Function ReadStockValue( _
+    ByVal value As Variant, _
+    ByVal sheetRow As Long, _
+    ByVal periodLabel As String) As Double
+
+    If IsError(value) Then
+        Err.Raise vbObjectError + 1080, "ReadStockValue", _
+                  "第 " & sheetRow & " 列、" & periodLabel & _
+                  "：庫存為Excel錯誤值。"
+    End If
+
+    If Len(Trim$(CStr(value))) = 0 Then
+        ReadStockValue = 0#
+
+    ElseIf IsNumeric(value) Then
+        ReadStockValue = CDbl(value)
+
+    Else
+        Err.Raise vbObjectError + 1081, "ReadStockValue", _
+                  "第 " & sheetRow & " 列、" & periodLabel & _
+                  "：庫存必須為數字，目前為「" & CStr(value) & "」。"
+    End If
+End Function
+
+'============================================================
+' 模擬計算
+'============================================================
+
+Private Function FindFirstNegativeWeek(ByRef curve() As Double) As Long
+
+    Dim weekIndex As Long
+
+    For weekIndex = LBound(curve) To UBound(curve)
+
+        If curve(weekIndex) < 0# Then
+            FindFirstNegativeWeek = weekIndex
+            Exit Function
+        End If
+    Next weekIndex
+
+    FindFirstNegativeWeek = -1
+End Function
+
+Private Function RoundUpToBatch( _
+    ByVal requiredQuantity As Double, _
+    ByVal batchSize As Double) As Double
+
+    Dim ratio As Double
+    Dim batchCount As Long
+
+    If batchSize <= 0# Then batchSize = DEFAULT_BATCH
+
+    If requiredQuantity <= 0# Then
+        RoundUpToBatch = batchSize
+        Exit Function
+    End If
+
+    ratio = requiredQuantity / batchSize
+    batchCount = CLng(Int(ratio))
+
+    If ratio - CDbl(batchCount) > 0.0000000001 Then
+        batchCount = batchCount + 1
+    End If
+
+    If batchCount < 1 Then batchCount = 1
+
+    RoundUpToBatch = CDbl(batchCount) * batchSize
+End Function
+
+Private Function CeilingToLong(ByVal value As Double) As Long
+
+    Dim integerPart As Long
+
+    integerPart = CLng(Int(value))
+
+    If value - CDbl(integerPart) > 0.0000000001 Then
+        integerPart = integerPart + 1
+    End If
+
+    CeilingToLong = integerPart
+End Function
+
+Private Function EmptyToZero(ByVal value As Variant) As Double
+
+    If IsEmpty(value) Or Len(Trim$(CStr(value))) = 0 Then
+        EmptyToZero = 0#
+    Else
+        EmptyToZero = CDbl(value)
+    End If
+End Function
+
+'============================================================
+' 輸出
+'============================================================
+
+Private Sub DeleteSheetIfExists( _
+    ByVal wb As Workbook, _
+    ByVal sheetName As String)
+
+    Dim ws As Worksheet
+
+    On Error Resume Next
+    Set ws = wb.Worksheets(sheetName)
+    On Error GoTo 0
+
+    If Not ws Is Nothing Then ws.Delete
+End Sub
+
+Private Function CopyOutputSheet( _
+    ByVal sourceSheet As Worksheet, _
+    ByVal newSheetName As String) As Worksheet
+
+    sourceSheet.Copy _
+        After:=sourceSheet.Parent.Worksheets(sourceSheet.Parent.Worksheets.count)
+
+    Set CopyOutputSheet = _
+        sourceSheet.Parent.Worksheets(sourceSheet.Parent.Worksheets.count)
+
+    CopyOutputSheet.Name = newSheetName
+End Function
+
+Private Sub WriteOutput( _
+    ByVal ws As Worksheet, _
+    ByRef outputData As Variant, _
+    ByVal startStockCol As Long, _
+    ByVal firstWeekCol As Long, _
+    ByVal lastWeekCol As Long, _
+    ByVal lastClearCol As Long, _
+    ByVal lastDataRow As Long)
+
+    'P類型的起始欄、真正週欄與後方輔助欄全部清內容，
+    '但保留原有格式。
+    ws.Range( _
+        ws.Cells(FIRST_DATA_ROW, startStockCol), _
+        ws.Cells(lastDataRow, lastClearCol)).ClearContents
+
+    '訂單寫入完整時間軸，包含原本標示為「輔助欄」的後續週數。
+    ws.Range( _
+        ws.Cells(FIRST_DATA_ROW, firstWeekCol), _
+        ws.Cells(lastDataRow, lastWeekCol)).Value2 = outputData
+End Sub
+
+Private Function ElapsedTimeSeconds(ByVal startTime As Double) As Double
+
+    Dim currentTime As Double
+    currentTime = Timer
+
+    If currentTime >= startTime Then
+        ElapsedTimeSeconds = currentTime - startTime
+    Else
+        ElapsedTimeSeconds = (86400# - startTime) + currentTime
+    End If
+End Function
