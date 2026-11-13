@@ -1,0 +1,45 @@
+Sub 選取對角線以下範圍()
+
+    Dim rngSource As Range
+    Dim rngResult As Range
+    Dim rngRow As Range
+    Dim i As Long
+    Dim selectCount As Long
+
+    '確認目前選取的是儲存格
+    If TypeName(Selection) <> "Range" Then
+        MsgBox "請先選取一個矩形儲存格範圍。", vbExclamation
+        Exit Sub
+    End If
+
+    Set rngSource = Selection
+
+    '不允許原始範圍包含多個不連續區域
+    If rngSource.Areas.count > 1 Then
+        MsgBox "請只選取一個連續的矩形範圍。", vbExclamation
+        Exit Sub
+    End If
+
+    For i = 1 To rngSource.Rows.count
+
+        '每往下一列，多選取一欄
+        selectCount = i
+
+        '若列數超過欄數，後續列選取整列範圍
+        If selectCount > rngSource.Columns.count Then
+            selectCount = rngSource.Columns.count
+        End If
+
+        Set rngRow = rngSource.Cells(i, 1).Resize(1, selectCount)
+
+        If rngResult Is Nothing Then
+            Set rngResult = rngRow
+        Else
+            Set rngResult = Union(rngResult, rngRow)
+        End If
+
+    Next i
+
+    rngResult.Select
+
+End Sub
