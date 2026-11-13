@@ -1,0 +1,604 @@
+Option Explicit
+
+'==================================================================
+' 功能：
+'   從目前儲存格數值中，扣除「WIP / 庫存」中的 FP / FPA 訂單數量
+'
+' 處理範圍：
+'   CJ11:EG1999
+'
+' 會扣除：
+'   WIP*FP...
+'   WIP*FPA...
+'   國內庫存FP...
+'   國內庫存FPA...
+'   國內未裝櫃庫存FP...
+'   國內未裝櫃庫存FPA...
+'
+' 不會扣除：
+'   IVT / IVC / IVM 區塊底下的一般 FP / FPA 訂單
+'
+'   例如：
+'   IVT260611045
+'    OE260311006-1(225000)
+'    FP260311007-1(100000)
+'    FPA260311008-1(50000)
+'
+'   上述 FP / FPA 全部保留，不扣除。
+'
+' 其他規則：
+'   1. 註解完全不修改
+'   2. 扣除後 > 0 → 寫回剩餘數量
+'   3. 扣除後 = 0 → ClearContents，保留註解與格式
+'   4. 扣除量 > 儲存格目前數值 → 不修改，最後集中提示
+'   5. 有值但沒有註解 → 不處理，最後集中提示
+'   6. FP 訂單中即使有空格也能判斷
+'   7. FPA 因為也是 FP 開頭，所以自動視為 FP 訂單
+'==================================================================
+
+Public Sub RemoveFPWIPInventoryQty()
+
+    Const MAX_DISPLAY As Long = 50
+
+    Dim ws As Worksheet
+    Dim rng As Range
+    Dim constRange As Range
+    Dim cell As Range
+
+    Dim commentText As String
+
+    Dim currentQty As Double
+    Dim deductQty As Double
+    Dim newQty As Double
+
+    Dim changedCount As Long
+    Dim clearedCount As Long
+    Dim noFPCount As Long
+
+    Dim noCommentCount As Long
+    Dim abnormalCount As Long
+    Dim nonNumericCount As Long
+
+    Dim totalDeductQty As Double
+
+    Dim noCommentList As String
+    Dim abnormalList As String
+    Dim nonNumericList As String
+
+    Dim noCommentShown As Long
+    Dim abnormalShown As Long
+    Dim nonNumericShown As Long
+
+    Dim oldCalculation As XlCalculation
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+
+    Dim errorNumber As Long
+    Dim errorDescription As String
+
+    Set ws = ActiveSheet
+    Set rng = ws.Range("CJ11:EG1999")
+
+    '--------------------------------------------------------------
+    '記錄 Excel 原本狀態
+    '--------------------------------------------------------------
+    oldCalculation = Application.Calculation
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+
+    '--------------------------------------------------------------
+    '加速
+    '--------------------------------------------------------------
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    On Error GoTo ErrorHandler
+
+    '--------------------------------------------------------------
+    '只取得目前有常數值的儲存格
+    '--------------------------------------------------------------
+    On Error Resume Next
+
+    Set constRange = rng.SpecialCells( _
+                        xlCellTypeConstants, _
+                        xlNumbers Or xlTextValues)
+
+    On Error GoTo ErrorHandler
+
+    If constRange Is Nothing Then
+
+        MsgBox "範圍 " & rng.Address(False, False) & _
+               " 內沒有有值的儲存格。", _
+               vbInformation, _
+               "移除 FP WIP / 庫存數量"
+
+        GoTo SafeExit
+
+    End If
+
+    '==============================================================
+    '逐格處理
+    '==============================================================
+    For Each cell In constRange.Cells
+
+        '----------------------------------------------------------
+        '有值但沒有註解
+        '----------------------------------------------------------
+        If cell.Comment Is Nothing Then
+
+            noCommentCount = noCommentCount + 1
+
+            If noCommentShown < MAX_DISPLAY Then
+
+                If Len(noCommentList) > 0 Then
+                    noCommentList = noCommentList & "、"
+                End If
+
+                noCommentList = noCommentList & _
+                                cell.Address(False, False)
+
+                noCommentShown = noCommentShown + 1
+
+            End If
+
+        Else
+
+            '------------------------------------------------------
+            '儲存格目前內容必須為數字
+            '------------------------------------------------------
+            If Not IsNumeric(cell.value) Then
+
+                nonNumericCount = nonNumericCount + 1
+
+                If nonNumericShown < MAX_DISPLAY Then
+
+                    If Len(nonNumericList) > 0 Then
+                        nonNumericList = nonNumericList & "、"
+                    End If
+
+                    nonNumericList = nonNumericList & _
+                                     cell.Address(False, False)
+
+                    nonNumericShown = nonNumericShown + 1
+
+                End If
+
+            Else
+
+                currentQty = CDbl(cell.value)
+                commentText = cell.Comment.Text
+
+                '--------------------------------------------------
+                '計算此格需要扣除多少 FP / FPA
+                '--------------------------------------------------
+                deductQty = GetFPWIPInventoryQty(commentText)
+
+                If deductQty <= 0 Then
+
+                    '沒有需要扣除的 FP / FPA
+                    noFPCount = noFPCount + 1
+
+                ElseIf deductQty > currentQty Then
+
+                    '------------------------------------------------
+                    '扣除量比目前儲存格數量還大
+                    '不修改，列入異常
+                    '------------------------------------------------
+                    abnormalCount = abnormalCount + 1
+
+                    If abnormalShown < MAX_DISPLAY Then
+
+                        If Len(abnormalList) > 0 Then
+                            abnormalList = abnormalList & vbCrLf
+                        End If
+
+                        abnormalList = abnormalList & _
+                            cell.Address(False, False) & _
+                            "　目前：" & Format$(currentQty, "#,##0") & _
+                            "　應扣：" & Format$(deductQty, "#,##0")
+
+                        abnormalShown = abnormalShown + 1
+
+                    End If
+
+                Else
+
+                    '------------------------------------------------
+                    '正常扣除
+                    '------------------------------------------------
+                    newQty = currentQty - deductQty
+
+                    If newQty = 0 Then
+
+                        '清空內容，Comment 不受影響
+                        cell.ClearContents
+
+                        clearedCount = clearedCount + 1
+
+                    Else
+
+                        cell.value = newQty
+
+                        changedCount = changedCount + 1
+
+                    End If
+
+                    totalDeductQty = totalDeductQty + deductQty
+
+                End If
+
+            End If
+
+        End If
+
+    Next cell
+
+
+SafeExit:
+
+    '--------------------------------------------------------------
+    '還原 Excel 狀態
+    '--------------------------------------------------------------
+    Application.ScreenUpdating = oldScreenUpdating
+    Application.Calculation = oldCalculation
+    Application.EnableEvents = oldEnableEvents
+
+    '--------------------------------------------------------------
+    '錯誤訊息
+    '--------------------------------------------------------------
+    If errorNumber <> 0 Then
+
+        MsgBox "執行失敗。" & vbCrLf & vbCrLf & _
+               "錯誤代碼：" & errorNumber & vbCrLf & _
+               "錯誤內容：" & errorDescription, _
+               vbCritical, _
+               "移除 FP WIP / 庫存數量"
+
+        Exit Sub
+
+    End If
+
+    If constRange Is Nothing Then Exit Sub
+
+    '==============================================================
+    '執行結果
+    '==============================================================
+    MsgBox _
+        "執行完成！" & vbCrLf & vbCrLf & _
+        "已扣除並更新：" & changedCount & " 格" & vbCrLf & _
+        "扣除後為 0、已清空：" & clearedCount & " 格" & vbCrLf & _
+        "實際扣除總數量：" & Format$(totalDeductQty, "#,##0") & vbCrLf & _
+        "沒有 FP/FPA WIP/庫存：" & noFPCount & " 格" & vbCrLf & _
+        "扣除量異常、未修改：" & abnormalCount & " 格" & vbCrLf & _
+        "有值但無註解、已略過：" & noCommentCount & " 格", _
+        vbInformation, _
+        "FP WIP / 庫存移除完成"
+
+
+    '==============================================================
+    '異常：扣除量 > 目前數量
+    '==============================================================
+    If abnormalCount > 0 Then
+
+        If abnormalCount > abnormalShown Then
+
+            abnormalList = abnormalList & vbCrLf & _
+                           "……另外還有 " & _
+                           abnormalCount - abnormalShown & _
+                           " 格未列出。"
+
+        End If
+
+        MsgBox _
+            "以下儲存格的 FP/FPA 扣除量" & _
+            "大於目前儲存格數量，因此沒有修改：" & _
+            vbCrLf & vbCrLf & _
+            abnormalList, _
+            vbExclamation, _
+            "數量異常"
+
+    End If
+
+
+    '==============================================================
+    '有值但沒有註解
+    '==============================================================
+    If noCommentCount > 0 Then
+
+        If noCommentCount > noCommentShown Then
+
+            noCommentList = noCommentList & vbCrLf & vbCrLf & _
+                            "另外還有 " & _
+                            noCommentCount - noCommentShown & _
+                            " 格未列出。"
+
+        End If
+
+        MsgBox _
+            "以下儲存格有值但沒有註解，" & _
+            "因此保留原值並略過：" & _
+            vbCrLf & vbCrLf & _
+            noCommentList, _
+            vbExclamation, _
+            "無註解儲存格"
+
+    End If
+
+
+    '==============================================================
+    '有註解但儲存格不是數字
+    '==============================================================
+    If nonNumericCount > 0 Then
+
+        If nonNumericCount > nonNumericShown Then
+
+            nonNumericList = nonNumericList & vbCrLf & vbCrLf & _
+                             "另外還有 " & _
+                             nonNumericCount - nonNumericShown & _
+                             " 格未列出。"
+
+        End If
+
+        MsgBox _
+            "以下儲存格有註解，但目前內容不是數字，" & _
+            "因此沒有修改：" & _
+            vbCrLf & vbCrLf & _
+            nonNumericList, _
+            vbExclamation, _
+            "非數字儲存格"
+
+    End If
+
+    Exit Sub
+
+
+ErrorHandler:
+
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+
+    Resume SafeExit
+
+End Sub
+
+
+'==================================================================
+' 計算單一 Comment 中：
+'
+'   WIP / 庫存類型之 FP / FPA 訂單數量總和
+'
+' 只辨識以下類型：
+'
+'   WIP*FP260...
+'   WIP*FPA260...
+'
+'   國內庫存FP260...
+'   國內庫存FPA260...
+'
+'   國內未裝櫃庫存FP260...
+'   國內未裝櫃庫存FPA260...
+'
+' IVT / IVC / IVM 區塊中的一般訂單完全不處理。
+'==================================================================
+
+Private Function GetFPWIPInventoryQty( _
+    ByVal commentText As String) As Double
+
+    Dim lines() As String
+    Dim i As Long
+
+    Dim lineStr As String
+    Dim qty As Double
+
+    Dim total As Double
+
+    total = 0
+
+    '--------------------------------------------------------------
+    '統一換行
+    '--------------------------------------------------------------
+    commentText = Replace(commentText, vbCrLf, vbLf)
+    commentText = Replace(commentText, vbCr, vbLf)
+
+    '--------------------------------------------------------------
+    '統一全形符號
+    '--------------------------------------------------------------
+    commentText = Replace(commentText, ChrW$(65288), "(")
+    commentText = Replace(commentText, ChrW$(65289), ")")
+    commentText = Replace(commentText, ChrW$(12288), " ")
+
+    lines = Split(commentText, vbLf)
+
+    '--------------------------------------------------------------
+    '逐行判斷
+    '--------------------------------------------------------------
+    For i = LBound(lines) To UBound(lines)
+
+        lineStr = Trim$(lines(i))
+
+        If Len(lineStr) > 0 Then
+
+            qty = GetFPQtyFromWIPOrInventoryLine(lineStr)
+
+            If qty > 0 Then
+                total = total + qty
+            End If
+
+        End If
+
+    Next i
+
+    GetFPWIPInventoryQty = total
+
+End Function
+
+
+'==================================================================
+' 判斷單一行是不是：
+'
+'   WIP* FP/FPA
+'   國內庫存 FP/FPA
+'   國內未裝櫃庫存 FP/FPA
+'
+' 如果是：
+'   回傳括號內數量
+'
+' 如果不是：
+'   回傳 0
+'
+' 特別注意：
+'
+'   以下不會進入本函數的扣除條件：
+'
+'   IVT260611045
+'    FP260311007-1(100000)
+'
+' 因為 FP 那行沒有 WIP* 或庫存前綴，所以不會扣除。
+'==================================================================
+
+Private Function GetFPQtyFromWIPOrInventoryLine( _
+    ByVal lineStr As String) As Double
+
+    Dim detailStr As String
+
+    Dim orderText As String
+    Dim orderKey As String
+
+    Dim qtyText As String
+    Dim qtyValue As Double
+
+    Dim posStart As Long
+    Dim posEnd As Long
+
+    GetFPQtyFromWIPOrInventoryLine = 0
+
+    '--------------------------------------------------------------
+    '標準化
+    '--------------------------------------------------------------
+    lineStr = Trim$(lineStr)
+
+    lineStr = Replace(lineStr, ChrW$(65288), "(")
+    lineStr = Replace(lineStr, ChrW$(65289), ")")
+    lineStr = Replace(lineStr, ChrW$(12288), " ")
+
+
+    '==============================================================
+    '1. 國內未裝櫃庫存
+    '
+    '必須放在「國內庫存」之前判斷
+    '==============================================================
+    If Left$(lineStr, Len("國內未裝櫃庫存")) = _
+                    "國內未裝櫃庫存" Then
+
+        detailStr = Mid$( _
+                        lineStr, _
+                        Len("國內未裝櫃庫存") + 1)
+
+
+    '==============================================================
+    '2. 國內庫存
+    '==============================================================
+    ElseIf Left$(lineStr, Len("國內庫存")) = _
+                        "國內庫存" Then
+
+        detailStr = Mid$( _
+                        lineStr, _
+                        Len("國內庫存") + 1)
+
+
+    '==============================================================
+    '3. WIP*
+    '==============================================================
+    ElseIf UCase$(Left$(lineStr, 4)) = "WIP*" Then
+
+        detailStr = Mid$(lineStr, 5)
+
+
+    '==============================================================
+    '不是 WIP / 庫存 → 一律不處理
+    '==============================================================
+    Else
+
+        Exit Function
+
+    End If
+
+
+    detailStr = Trim$(detailStr)
+
+    '--------------------------------------------------------------
+    '找數量括號
+    '--------------------------------------------------------------
+    posStart = InStr(1, detailStr, "(", vbBinaryCompare)
+
+    If posStart = 0 Then Exit Function
+
+    posEnd = InStr( _
+                    posStart + 1, _
+                    detailStr, _
+                    ")", _
+                    vbBinaryCompare)
+
+    If posEnd <= posStart Then Exit Function
+
+
+    '==============================================================
+    '取得訂單號碼
+    '==============================================================
+    orderText = Left$(detailStr, posStart - 1)
+
+    orderText = Trim$(orderText)
+
+    '--------------------------------------------------------------
+    '去除空格
+    '
+    '例如：
+    'FP 260625007-1
+    'FPA 260625007-1
+    '
+    '都可以正常判斷
+    '--------------------------------------------------------------
+    orderKey = UCase$(orderText)
+
+    orderKey = Replace(orderKey, " ", "")
+    orderKey = Replace(orderKey, vbTab, "")
+    orderKey = Replace(orderKey, ChrW$(12288), "")
+
+
+    '==============================================================
+    '不是 FP 開頭 → 不扣
+    '
+    'FP...  → 符合
+    'FPA... → 也符合
+    '==============================================================
+    If Len(orderKey) < 2 Then Exit Function
+
+    If Left$(orderKey, 2) <> "FP" Then Exit Function
+
+
+    '==============================================================
+    '取得數量
+    '==============================================================
+    qtyText = Mid$( _
+                    detailStr, _
+                    posStart + 1, _
+                    posEnd - posStart - 1)
+
+    qtyText = Replace(qtyText, ",", "")
+    qtyText = Replace(qtyText, " ", "")
+    qtyText = Replace(qtyText, vbTab, "")
+    qtyText = Replace(qtyText, ChrW$(12288), "")
+
+    qtyText = Trim$(qtyText)
+
+    If Not IsNumeric(qtyText) Then Exit Function
+
+    qtyValue = CDbl(qtyText)
+
+    If qtyValue <= 0 Then Exit Function
+
+    GetFPQtyFromWIPOrInventoryLine = qtyValue
+
+End Function
+
