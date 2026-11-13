@@ -1,0 +1,337 @@
+Option Explicit
+
+Sub 重建ReleaseAnalyzes分頁()
+
+    Const SOURCE_SHEET As String = "Release Analyzes"
+    Const TARGET_SHEET As String = "Release Analyzes New"
+
+    Dim wb As Workbook
+    Dim wsOld As Worksheet
+    Dim wsNew As Worksheet
+    Dim originalSheet As Worksheet
+
+    Dim lastCell As Range
+    Dim rngOld As Range
+    Dim tempUsedRange As Range
+
+    Dim lastRow As Long
+    Dim lastColumn As Long
+
+    Dim r As Long
+    Dim c As Long
+    Dim level As Long
+
+    Dim maxRowLevel As Long
+    Dim maxColLevel As Long
+    Dim groupStart As Long
+    Dim inGroup As Boolean
+
+    Dim wasFrozen As Boolean
+    Dim splitRow As Long
+    Dim splitColumn As Long
+
+    Dim oldScreenUpdating As Boolean
+    Dim oldEnableEvents As Boolean
+    Dim oldDisplayAlerts As Boolean
+    Dim oldCalculation As XlCalculation
+
+    On Error GoTo ErrorHandler
+
+    Set wb = ActiveWorkbook
+    Set wsOld = wb.Worksheets(SOURCE_SHEET)
+    Set originalSheet = ActiveSheet
+
+    '==================================================
+    '以 Ctrl + End 相同邏輯取得最後使用儲存格
+    '==================================================
+    Set lastCell = wsOld.Cells.SpecialCells(xlCellTypeLastCell)
+
+    lastRow = lastCell.Row
+    lastColumn = lastCell.Column
+
+    Set rngOld = wsOld.Range( _
+        wsOld.Cells(1, 1), _
+        wsOld.Cells(lastRow, lastColumn))
+
+    '保存 Excel 原本狀態
+    oldScreenUpdating = Application.ScreenUpdating
+    oldEnableEvents = Application.EnableEvents
+    oldDisplayAlerts = Application.DisplayAlerts
+    oldCalculation = Application.Calculation
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+
+    '==================================================
+    '取得原分頁的凍結窗格設定
+    '==================================================
+    wsOld.Activate
+
+    wasFrozen = ActiveWindow.FreezePanes
+    splitRow = ActiveWindow.splitRow
+    splitColumn = ActiveWindow.splitColumn
+
+    '==================================================
+    '如果目標分頁已存在，先刪除
+    '==================================================
+    On Error Resume Next
+    wb.Worksheets(TARGET_SHEET).Delete
+    On Error GoTo ErrorHandler
+
+    '建立全新的空白分頁
+    Set wsNew = wb.Worksheets.Add(After:=wsOld)
+    wsNew.Name = TARGET_SHEET
+
+    '==================================================
+    '複製內容、公式、格式、註解、條件格式、驗證等
+    '==================================================
+    rngOld.Copy
+    wsNew.Range("A1").PasteSpecial Paste:=xlPasteAll
+
+    Application.CutCopyMode = False
+
+    '==================================================
+    '複製欄寬及隱藏狀態
+    '==================================================
+    For c = 1 To lastColumn
+
+        wsNew.Columns(c).ColumnWidth = _
+            wsOld.Columns(c).ColumnWidth
+
+        wsNew.Columns(c).Hidden = _
+            wsOld.Columns(c).Hidden
+
+    Next c
+
+    '==================================================
+    '複製列高及隱藏狀態
+    '==================================================
+    For r = 1 To lastRow
+
+        wsNew.Rows(r).RowHeight = _
+            wsOld.Rows(r).RowHeight
+
+        wsNew.Rows(r).Hidden = _
+            wsOld.Rows(r).Hidden
+
+    Next r
+
+    '==================================================
+    '找出最大的列群組層級
+    '==================================================
+    maxRowLevel = 1
+
+    For r = 1 To lastRow
+
+        If wsOld.Rows(r).OutlineLevel > maxRowLevel Then
+            maxRowLevel = wsOld.Rows(r).OutlineLevel
+        End If
+
+    Next r
+
+    '==================================================
+    '重建列群組
+    '==================================================
+    For level = 2 To maxRowLevel
+
+        inGroup = False
+        groupStart = 0
+
+        For r = 1 To lastRow + 1
+
+            If r <= lastRow Then
+
+                If wsOld.Rows(r).OutlineLevel >= level Then
+
+                    If inGroup = False Then
+                        groupStart = r
+                        inGroup = True
+                    End If
+
+                Else
+
+                    If inGroup = True Then
+
+                        wsNew.Rows( _
+                            groupStart & ":" & (r - 1) _
+                        ).Group
+
+                        inGroup = False
+
+                    End If
+
+                End If
+
+            Else
+
+                If inGroup = True Then
+
+                    wsNew.Rows( _
+                        groupStart & ":" & lastRow _
+                    ).Group
+
+                    inGroup = False
+
+                End If
+
+            End If
+
+        Next r
+
+    Next level
+
+    '==================================================
+    '找出最大的欄群組層級
+    '==================================================
+    maxColLevel = 1
+
+    For c = 1 To lastColumn
+
+        If wsOld.Columns(c).OutlineLevel > maxColLevel Then
+            maxColLevel = wsOld.Columns(c).OutlineLevel
+        End If
+
+    Next c
+
+    '==================================================
+    '重建欄群組
+    '==================================================
+    For level = 2 To maxColLevel
+
+        inGroup = False
+        groupStart = 0
+
+        For c = 1 To lastColumn + 1
+
+            If c <= lastColumn Then
+
+                If wsOld.Columns(c).OutlineLevel >= level Then
+
+                    If inGroup = False Then
+                        groupStart = c
+                        inGroup = True
+                    End If
+
+                Else
+
+                    If inGroup = True Then
+
+                        wsNew.Range( _
+                            wsNew.Columns(groupStart), _
+                            wsNew.Columns(c - 1) _
+                        ).Columns.Group
+
+                        inGroup = False
+
+                    End If
+
+                End If
+
+            Else
+
+                If inGroup = True Then
+
+                    wsNew.Range( _
+                        wsNew.Columns(groupStart), _
+                        wsNew.Columns(lastColumn) _
+                    ).Columns.Group
+
+                    inGroup = False
+
+                End If
+
+            End If
+
+        Next c
+
+    Next level
+
+    '==================================================
+    '群組建立後重新套用隱藏列、隱藏欄
+    '==================================================
+    For r = 1 To lastRow
+        wsNew.Rows(r).Hidden = wsOld.Rows(r).Hidden
+    Next r
+
+    For c = 1 To lastColumn
+        wsNew.Columns(c).Hidden = wsOld.Columns(c).Hidden
+    Next c
+
+    '==================================================
+    '複製群組摘要位置
+    '==================================================
+    wsNew.Outline.SummaryRow = wsOld.Outline.SummaryRow
+    wsNew.Outline.SummaryColumn = wsOld.Outline.SummaryColumn
+
+    '==================================================
+    '複製自動篩選
+    '==================================================
+    If wsOld.AutoFilterMode Then
+
+        If Not wsOld.AutoFilter Is Nothing Then
+
+            wsNew.Range( _
+                wsOld.AutoFilter.Range.Address _
+            ).AutoFilter
+
+        End If
+
+    End If
+
+    '==================================================
+    '複製凍結窗格
+    '==================================================
+    wsNew.Activate
+
+    ActiveWindow.FreezePanes = False
+    ActiveWindow.splitRow = 0
+    ActiveWindow.splitColumn = 0
+
+    If wasFrozen Then
+
+        ActiveWindow.splitRow = splitRow
+        ActiveWindow.splitColumn = splitColumn
+        ActiveWindow.FreezePanes = True
+
+    End If
+
+    '==================================================
+    '更新新分頁的 UsedRange
+    '==================================================
+    Set tempUsedRange = wsNew.UsedRange
+    Set tempUsedRange = Nothing
+
+    '不設定 ScrollArea，不鎖死範圍
+    wsNew.Range("A1").Select
+
+    MsgBox _
+        "新分頁已建立完成：" & TARGET_SHEET & vbCrLf & vbCrLf & _
+        "Ctrl + End 偵測位置：" & _
+        lastCell.Address(False, False) & vbCrLf & _
+        "實際複製範圍：" & _
+        rngOld.Address(False, False), _
+        vbInformation
+
+ExitHandler:
+
+    Application.CutCopyMode = False
+    Application.ScreenUpdating = oldScreenUpdating
+    Application.EnableEvents = oldEnableEvents
+    Application.DisplayAlerts = oldDisplayAlerts
+    Application.Calculation = oldCalculation
+
+    Exit Sub
+
+ErrorHandler:
+
+    MsgBox _
+        "建立新分頁時發生錯誤：" & vbCrLf & _
+        Err.Number & " - " & Err.Description, _
+        vbExclamation
+
+    Resume ExitHandler
+
+End Sub
+
