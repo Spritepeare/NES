@@ -1,0 +1,257 @@
+Sub 上黃色()
+'
+' 上黃色 巨集
+'
+' 快速鍵: Ctrl+Shift+C
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(255, 255, 0) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(255, 255, 0)
+        End If
+    Next cell
+End Sub
+Sub 上紅色()
+'
+' 上紅色 巨集
+'
+' 快速鍵: Ctrl+Shift+Z
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(230, 184, 183) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(230, 184, 183)
+        End If
+    Next cell
+End Sub
+Sub 上淺橘色()
+'
+' 上淺橘色 巨集
+' 上淺橘色
+'
+' 快速鍵: Ctrl+Shift+X
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(255, 204, 102) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(255, 204, 102)
+        End If
+    Next cell
+End Sub
+Sub 上綠色()
+'
+' 上綠色 巨集
+' 上綠色
+'
+' 快速鍵: Ctrl+Shift+V
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(167, 217, 113) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(167, 217, 113)
+        End If
+    Next cell
+End Sub
+Sub 上藍色()
+
+' 上藍色 巨集
+' 上藍色
+'
+' 快速鍵: Ctrl+Shift+B
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(197, 217, 241) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(197, 217, 241)
+        End If
+    Next cell
+End Sub
+Sub 上紫色()
+
+' 上紫色 巨集
+' 上紫色
+'
+' 快速鍵: Ctrl+Shift+N
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(204, 192, 218) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(204, 192, 218)
+        End If
+    Next cell
+End Sub
+
+Sub 上淺灰色()
+
+' 上淺灰色 巨集
+' 上淺灰色
+'
+' 快速鍵: Ctrl+Shift+A
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(217, 217, 217) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(217, 217, 217)
+        End If
+    Next cell
+End Sub
+
+Sub 上深灰色()
+
+' 上深灰色 巨集
+' 上深灰色
+'
+' 快速鍵: Ctrl+Shift+S
+'
+    Dim cell As Range
+    For Each cell In Selection
+        If cell.Interior.Color = RGB(166, 166, 166) Then
+            cell.Interior.Pattern = xlNone
+        Else
+            cell.Interior.Color = RGB(166, 166, 166)
+        End If
+    Next cell
+End Sub
+
+Function EXNUM(txt As String) As String
+    Dim i As Integer
+    Dim result As String
+    For i = 1 To Len(txt)
+        If IsNumeric(Mid(txt, i, 1)) Then
+            result = result & Mid(txt, i, 1)
+        End If
+    Next i
+    EXNUM = result
+End Function
+
+Sub ChangeFontTwice()
+    Dim ws As Worksheet
+    Dim selectedRange As Range
+    
+    ' 記錄當前選取的儲存格
+    Set selectedRange = Selection
+    Set ws = ActiveSheet ' 只修改目前的工作表
+    
+    ' 設定整個工作表的字型為「微軟正黑體」
+    ws.Cells.Font.Name = "微軟正黑體"
+    
+    ' 設定整個工作表的字型為「Calibri」
+    ws.Cells.Font.Name = "Calibri"
+    
+    ' 回到原本選取的儲存格
+    selectedRange.Select
+End Sub
+
+Function FindNeg(labelRange As Range, dataRange As Range) As String
+    Dim i As Long
+    Dim startIdx As Long, endIdx As Long
+    Dim inNegBlock As Boolean
+    inNegBlock = False
+
+    ' 假設 labelRange 與 dataRange 欄數一致，且標籤第一個代表 WK 13
+    For i = 1 To dataRange.Columns.count
+        If dataRange.Cells(1, i).value < 0 Then
+            If Not inNegBlock Then
+                startIdx = i
+                inNegBlock = True
+            End If
+            endIdx = i
+        Else
+            ' 一旦已找到連續負數區間，遇到第一個正數就退出
+            If inNegBlock Then
+                Exit For
+            End If
+        End If
+    Next i
+
+    ' 若有找到連續負數區間，則根據 labelRange 輸出結果
+    If inNegBlock Then
+        ' 取得起始與結束標籤，假設標籤直接存 WK xx 字串
+        Dim startLabel As String, endLabel As String
+        startLabel = labelRange.Cells(1, startIdx).value
+        endLabel = labelRange.Cells(1, endIdx).value
+     ' 如果起始與斷線週相同，只顯示一週
+        If startIdx = endIdx Then
+            FindNeg = "W" & startLabel
+        Else
+        FindNeg = "W" & startLabel & "~" & "W" & endLabel
+        End If
+    Else
+        FindNeg = ""
+    End If
+End Function
+
+Sub ReplaceFillColor()
+    Dim rng As Range
+    Dim cell As Range
+    Dim targetColor As Long
+    Dim newColor As Long
+
+    ' 原始顏色 (0,204,255)
+    targetColor = RGB(0, 204, 255)
+    
+    ' 取代成的新顏色 (0,255,255)
+    newColor = RGB(0, 255, 255)
+
+    ' 範圍：目前工作表的使用範圍
+    Set rng = ActiveSheet.UsedRange
+
+    For Each cell In rng
+        If cell.Interior.Color = targetColor Then
+            cell.Interior.Color = newColor
+        End If
+    Next cell
+
+End Sub
+
+Sub RemoveRedundantConditionalFormats()
+    Dim ws As Worksheet
+    For Each ws In ThisWorkbook.Worksheets
+        ws.Cells.FormatConditions.Delete
+    Next ws
+    MsgBox "條件格式已移除。", vbInformation
+End Sub
+
+Sub ForceDeleteStyles()
+    Dim s As Style
+    Dim i As Long
+    Dim count As Long
+    
+    On Error Resume Next
+    
+    ' 優化效能：關閉畫面更新、自動計算與事件偵測
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    count = ActiveWorkbook.Styles.count
+    
+    ' 倒過來刪除通常比較穩定
+    For i = count To 1 Step -1
+        Set s = ActiveWorkbook.Styles(i)
+        If Not s.BuiltIn Then
+            s.Delete
+        End If
+    Next i
+    
+    ' 恢復設定
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+    
+    MsgBox "清理完成！"
+End Sub
