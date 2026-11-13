@@ -1,0 +1,203 @@
+Sub CalcSeaInTransit()
+
+    Dim ws As Worksheet
+    Dim rng As Range
+    Dim cell As Range
+    Dim constRange As Range
+    Dim commentText As String
+    Dim totalQty As Long
+    Dim writtenCount As Long
+    Dim clearedCount As Long
+    Dim noCommentCount As Long
+    
+    Set ws = ActiveSheet
+    Set rng = ws.Range("CJ11:EG1999")
+    
+    '--- 加速處理 ---
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+    
+    On Error GoTo CleanUp
+    
+    '--- 取得範圍內所有有常數值的儲存格 ---
+    On Error Resume Next
+    Set constRange = rng.SpecialCells( _
+        xlCellTypeConstants, _
+        xlNumbers + xlTextValues)
+    On Error GoTo CleanUp
+    
+    If constRange Is Nothing Then
+        MsgBox "範圍內沒有有值的儲存格。", vbInformation
+        GoTo CleanUp
+    End If
+    
+    writtenCount = 0
+    clearedCount = 0
+    noCommentCount = 0
+    
+    '--- 逐格處理 ---
+    For Each cell In constRange
+        
+        If cell.Comment Is Nothing Then
+            
+            noCommentCount = noCommentCount + 1
+            
+        Else
+            
+            commentText = cell.Comment.Text
+            totalQty = ParseSeaInTransitQuantity(commentText)
+            
+            If totalQty > 0 Then
+                
+                cell.value = totalQty
+                writtenCount = writtenCount + 1
+                
+            Else
+                
+                '無 IVT / IVC / IVM，清空內容
+                '保留註解及儲存格格式
+                cell.ClearContents
+                clearedCount = clearedCount + 1
+                
+            End If
+            
+        End If
+        
+    Next cell
+    
+    MsgBox "執行完成！" & vbCrLf & vbCrLf & _
+           "已更新海上在途數量：" & writtenCount & " 格" & vbCrLf & _
+           "已清空（無IVT/IVC/IVM）：" & clearedCount & " 格" & vbCrLf & _
+           "無註解（略過）：" & noCommentCount & " 格", _
+           vbInformation, _
+           "海上在途數量計算"
+
+CleanUp:
+
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+
+End Sub
+
+'==================================================================
+' 解析註解中的 IVT / IVC / IVM 數量總和
+'
+' 支援格式：
+'
+'   IVT260521017
+'    OE260309001-1(225000)
+'
+'   IVC260615002
+'    OI260311016-2(225000)
+'
+'   IVM260620001
+'    OE260401001-1(150000)
+'
+'   IVM260612001 (IVT260612022)
+'    OA260603008-1(30955)
+'
+' 回傳：
+' 所有 IVT / IVC / IVM 段落下一列括號內數量的總和
+'==================================================================
+
+Private Function ParseSeaInTransitQuantity( _
+    ByVal commentText As String) As Long
+
+    Dim lines() As String
+    Dim i As Long
+    Dim total As Long
+    
+    Dim lineStr As String
+    Dim nextLine As String
+    
+    Dim headerCode As String
+    Dim prefix As String
+    Dim numberPart As String
+    
+    Dim posStart As Long
+    Dim posEnd As Long
+    
+    Dim qtyStr As String
+    Dim qtyVal As Long
+    
+    total = 0
+    
+    '--- 統一換行符為 vbLf ---
+    commentText = Replace(commentText, vbCrLf, vbLf)
+    commentText = Replace(commentText, vbCr, vbLf)
+    
+    '--- 統一全形括號為半形 ---
+    commentText = Replace(commentText, ChrW$(65288), "(")
+    commentText = Replace(commentText, ChrW$(65289), ")")
+    
+    lines = Split(commentText, vbLf)
+    
+    For i = LBound(lines) To UBound(lines)
+        
+        lineStr = Trim$(lines(i))
+        
+        '海上在途標題最少為：
+        'IVT / IVC / IVM 加上 9 碼數字，共 12 個字元
+        If Len(lineStr) >= 12 Then
+            
+            '只取得開頭 12 個字元
+            '即使後面有「(IVT+9碼數字)」也不影響判斷
+            headerCode = Left$(lineStr, 12)
+            
+            prefix = UCase$(Left$(headerCode, 3))
+            numberPart = Mid$(headerCode, 4, 9)
+            
+            '--- 判斷 IVT、IVC 或 IVM ---
+            If prefix = "IVT" Or _
+               prefix = "IVC" Or _
+               prefix = "IVM" Then
+                
+                '確認第 4～12 字元為 9 碼數字
+                If Len(numberPart) = 9 And IsNumeric(numberPart) Then
+                    
+                    '--- 讀取下一列括號內的數量 ---
+                    If i + 1 <= UBound(lines) Then
+                        
+                        nextLine = lines(i + 1)
+                        
+                        posStart = InStr(1, nextLine, "(", vbTextCompare)
+                        
+                        If posStart > 0 Then
+                            
+                            posEnd = InStr(posStart + 1, nextLine, ")", vbTextCompare)
+                            
+                            If posEnd > posStart Then
+                                
+                                qtyStr = Mid$( _
+                                    nextLine, _
+                                    posStart + 1, _
+                                    posEnd - posStart - 1)
+                                
+                                '移除千分位逗號及空白
+                                qtyStr = Replace(qtyStr, ",", "")
+                                qtyStr = Trim$(qtyStr)
+                                
+                                If IsNumeric(qtyStr) Then
+                                    qtyVal = CLng(qtyStr)
+                                    total = total + qtyVal
+                                End If
+                                
+                            End If
+                            
+                        End If
+                        
+                    End If
+                    
+                End If
+                
+            End If
+            
+        End If
+        
+    Next i
+    
+    ParseSeaInTransitQuantity = total
+
+End Function
